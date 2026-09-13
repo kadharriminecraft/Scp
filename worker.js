@@ -1,44 +1,52 @@
-/* SCP WIKI WORKER - Cloudflare Worker: pure JSON API + asset proxy for the
-   SCP Wiki. Deploy: dash.cloudflare.com -> Workers & Pages -> Create Worker
-   -> paste this file -> Deploy (from any device that can open the dashboard).
-   Opening the worker URL shows a small JSON status object - that is expected:
-   this worker serves NO pages. The reader app is the separate single-file
-   scp-reader.html, which talks only to this worker's API (/api/page,
-   /api/search, /api/random, /raw/ for images and files).
-   Optional env vars: DEFAULT_SITE, EXTRA_HOSTS (comma-separated extra hosts). */
+/* SCP WIKI WORKER - Cloudflare Worker: pure JSON render + asset API for
+   the SCP Wiki. Deploy: dash.cloudflare.com -> Workers & Pages -> Create
+   Worker -> paste this file -> Deploy (from any device that can open the
+   dashboard). Opening the worker URL shows a small JSON status object -
+   that is expected: this worker serves NO pages. The browser app is the
+   separate single-file scp-browser.html, which paints the real wiki
+   inside a sandboxed iframe using /api/render packages from this worker
+   (/api/asset for images and fonts, /api/search + /api/random via Crom).
+   Optional env vars: DEFAULT_SITE, EXTRA_HOSTS (comma-separated hosts). */
 
 /* =====================================================================
-   SCP WIKI WORKER - Cloudflare Worker: pure JSON API + asset proxy
+   SCP WIKI WORKER - Cloudflare Worker: pure JSON render + asset API
    =====================================================================
    Purpose:
-     Lets the single-file mobile reader (scp-reader.html) browse the SCP
-     Wiki through YOUR worker, so the phone never contacts
-     scp-wiki.wikidot.com - everything arrives via this API.
+     The single-file mobile browser app (scp-browser.html) shows the REAL
+     SCP Wiki - actual pages, actual themes, actual layout - but every
+     byte flows through this worker as JSON. The phone never contacts
+     scp-wiki.wikidot.com, and the worker never serves a web page:
+     it returns a JSON "render package" and the app paints it inside a
+     sandboxed iframe. Opening the worker URL itself just shows a small
+     JSON status object - that is by design.
 
-   This worker deliberately serves NO web pages of its own (v2.1): it is
-   an API only. Opening the worker URL shows a small JSON status object -
-   that is expected. The reading experience lives in scp-reader.html.
-
-   URL scheme (what the worker serves):
-     /  (and /__worker/ping)      ->  JSON status + endpoint list
-     /api/page/<wikidot path>     ->  JSON { ok, status, host, path, html }
-                                      (redirects followed upstream, ads +
-                                      scripts + trackers stripped)
-     /api/page/<path>?host=<wiki> ->  same, for sibling wikis (scp-int...)
-     /api/search?q=               ->  JSON search results (Crom GraphQL)
-     /api/random                  ->  JSON random page (Crom GraphQL)
-     /raw/<host>/<path>?<query>   ->  proxied ASSETS (images, css, files).
-                                      HTML pages are never mirrored.
-     anything else                ->  JSON 404 with the endpoint list
+   URL scheme (everything the worker serves):
+     /  (and /__worker/ping)   ->  JSON status + endpoint list
+     /api/render?url=<page>    ->  JSON render package:
+         { ok, url, finalUrl, title, icon, html, assets }
+         - the REAL page HTML, fetched upstream (redirects followed)
+         - ads / trackers / ALL scripts / iframes removed
+         - stylesheets fetched + @import chains INLINED server-side
+         - images, fonts, css url() assets replaced with tokens
+           (the app loads them lazily through /api/asset)
+         - links absolutized so in-app navigation just works
+         - a tiny "bridge" script injected for clicks/scroll
+     /api/asset?url=<file>     ->  raw asset proxy (images, fonts,
+         files) with CORS. HTML content is refused (415) - the worker
+         never mirrors pages.
+     /api/search?q=<query>     ->  JSON search results (Crom GraphQL)
+     /api/random               ->  JSON random page (Crom GraphQL)
+     anything else             ->  JSON 404 with the endpoint list
 
    Security:
-     Only the Wikidot / SCP host family is proxied. It is NOT an open proxy.
-     Ads and trackers are stripped from pages for a clean, fast, native feel.
+     Pages are only rendered for the SCP / Wikidot host family (NOT an
+     open proxy). Assets may come from public hosts (fonts, embedded
+         images) but never from private networks or ad domains.
 
    Deploy:
-     Cloudflare dashboard -> Workers & Pages -> Create Worker -> paste this
-     whole file -> Deploy (from any device/network that can open
-     dash.cloudflare.com). Then open scp-reader.html on your phone and
+     Cloudflare dashboard -> Workers & Pages -> Create Worker -> paste
+     this whole file -> Deploy (from any device/network that can open
+     dash.cloudflare.com). Then open scp-browser.html on the phone and
      paste the worker URL (https://name.account.workers.dev) once.
      Optional environment variables:
        DEFAULT_SITE  (default: scp-wiki.wikidot.com)
@@ -47,11 +55,11 @@
 
 export default { fetch: handle };
 
-const VERSION = '2.1.0';
+const VERSION = '3.0.0';
 const DEFAULT_SITE_DEFAULT = 'scp-wiki.wikidot.com';
 const CROM_GRAPHQL = 'https://api.crom.avn.sh/graphql';
 
-/* Hosts that may be proxied. Suffixes cover *.wikidot.com / *.wdfiles.com. */
+/* Hosts whose PAGES may be rendered. Suffixes cover *.wikidot.com. */
 const EXACT_HOSTS = [
   'scp-wiki.wikidot.com',
   'scpwiki.com',
@@ -64,75 +72,35 @@ const EXACT_HOSTS = [
 const HOST_SUFFIXES = ['.wikidot.com', '.wdfiles.com'];
 const WIKIDOT_CDN_RE = /^d3g0gp89917ko\d\.cloudfront\.net$/; // wikidot's JS/CSS distros
 
-/* Ad / tracking domains whose tags are removed from proxied pages.
-   Matching is suffix-based: the domain and all its subdomains. */
+/* Ad / tracking domains whose tags are removed from pages. */
 const AD_DOMAINS = [
-  'hadronid.net',
-  'facebook.com',
-  'facebook.net',
-  'doubleclick.net',
-  'googlesyndication.com',
-  'googletagmanager.com',
-  'googletagservices.com',
-  'google-analytics.com',
-  'nitropay.com',
-  'onesignal.com',
-  'confiant-integrations.net',
-  'adnxs.com',
-  'ml314.com',
-  'id5-sync.com',
-  'ad.gt',
-  'p7cloud.net',
-  'adsrvr.org',
-  'criteo.com',
-  'amazon-adsystem.com',
-  'casalemedia.com',
-  'taboola.com',
-  'pubmatic.com',
-  'rubiconproject.com',
-  'sharethrough.com',
-  'openx.net',
-  '33across.com',
-  'bidswitch.net',
-  'media.net',
-  'demdex.net',
-  'agkn.com',
-  'moatads.com',
-  'adsafeprotected.com',
-  'triplelift.com',
-  'yieldmo.com',
-  'gumgum.com',
-  'smartadserver.com',
+  'hadronid.net', 'facebook.com', 'facebook.net', 'doubleclick.net',
+  'googlesyndication.com', 'googletagmanager.com', 'googletagservices.com',
+  'google-analytics.com', 'nitropay.com', 'onesignal.com',
+  'confiant-integrations.net', 'adnxs.com', 'ml314.com', 'id5-sync.com',
+  'ad.gt', 'p7cloud.net', 'adsrvr.org', 'criteo.com', 'amazon-adsystem.com',
+  'casalemedia.com', 'taboola.com', 'pubmatic.com', 'rubiconproject.com',
+  'sharethrough.com', 'openx.net', '33across.com', 'bidswitch.net',
+  'media.net', 'demdex.net', 'agkn.com', 'moatads.com', 'adsafeprotected.com',
+  'triplelift.com', 'yieldmo.com', 'gumgum.com', 'smartadserver.com',
   'd3j8vl19c1131u.cloudfront.net',
 ];
 function isAdDomain(host) {
   host = String(host || '').toLowerCase();
   return AD_DOMAINS.some(d => host === d || host.endsWith('.' + d));
 }
-/* Markers that identify inline ad/tracker scripts. */
 const AD_MARKERS_RE = /(nitroAds|OneSignal|dataLayer|googletag|gtag\(|fbevents|aspan|confiant|prebid|adnxs|hadronid|nitropay|_pbjs|apstag|__tcfapi|doubleclick|adsbygoogle|adservice)/i;
 
-const MAX_BODY = 10 * 1024 * 1024;
-const MAX_TEXT = 4 * 1024 * 1024;
 const UPSTREAM_TIMEOUT = 25000;
-const CACHEABLE_CT = /^(image\/|font\/|application\/font|text\/css|application\/javascript|text\/javascript|application\/x-javascript|application\/wasm|application\/octet-stream)/i;
+const MAX_HTML = 6 * 1024 * 1024;
+const MAX_ASSET = 30 * 1024 * 1024;
+const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-/* Request headers worth forwarding upstream. */
-const FORWARD_REQ_HEADERS = [
-  'accept', 'accept-language', 'content-type', 'user-agent',
-  'range', 'if-none-match', 'if-modified-since', 'if-range',
-  'x-requested-with', 'cookie',
-];
-/* Response headers removed (framing/CSP blockers + hop-by-hop). */
-const STRIP_RESP_HEADERS = new Set([
-  'content-security-policy', 'content-security-policy-report-only',
-  'x-frame-options', 'strict-transport-security', 'report-to', 'nel',
-  'set-cookie', 'content-encoding', 'content-length', 'transfer-encoding',
-  'connection', 'keep-alive', 'upgrade', 'x-powered-by', 'alt-svc',
-]);
+/* 1x1 transparent GIF used as the placeholder for tokenized images. */
+const PX_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 /* ------------------------------------------------------------------ */
-/* Helpers                                                             */
+/* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
 function defaultSite(env) {
@@ -152,93 +120,94 @@ function hostAllowed(host, env) {
   return false;
 }
 
-/* /raw/<host>/<path...>  ->  { host, path }  (path is pathname only) */
-function parseRaw(pathname) {
-  const m = String(pathname || '').match(/^\/raw\/([^/]+)(\/.*)?$/);
-  if (!m) return null;
-  let host = m[1];
-  try { host = decodeURIComponent(host); } catch (e) {}
-  return { host: host.toLowerCase(), path: m[2] || '/' };
-}
-
-function upstreamHeaders(request, upstreamUrl) {
-  const h = new Headers();
-  for (const k of FORWARD_REQ_HEADERS) {
-    const v = request.headers.get(k);
-    if (v != null) h.set(k, v);
+function isPrivateHost(h) {
+  h = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  if (h === 'localhost' || h === '::1' || h === '0.0.0.0' || h === '::') return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) {
+    const p = h.split('.').map(Number);
+    if (p[0] === 127 || p[0] === 10 || p[0] === 0) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 169 && p[1] === 254) return true;
+    return false;
   }
-  /* Rebuild the upstream referer from our own /raw referer if possible. */
-  const ref = request.headers.get('referer');
-  if (ref) {
-    try {
-      const r = new URL(ref);
-      const t = parseRaw(r.pathname);
-      if (t) h.set('referer', 'https://' + t.host + t.path);
-    } catch (e) {}
-  }
-  if (!h.has('referer')) h.set('referer', upstreamUrl.origin + '/');
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    h.set('origin', upstreamUrl.origin);
-  }
-  return h;
+  if (h.endsWith('.internal') || h.endsWith('.local') || h === 'metadata.google.internal') return true;
+  return false;
 }
 
-function getSetCookies(res) {
-  try { if (typeof res.headers.getAll === 'function') return res.headers.getAll('set-cookie'); } catch (e) {}
-  try { if (typeof res.headers.getSetCookie === 'function') return res.headers.getSetCookie(); } catch (e) {}
-  const single = res.headers.get('set-cookie');
-  return single ? [single] : [];
+/* Asset URLs: any PUBLIC http(s) host that is not an ad domain.
+   (Pages are restricted to the wiki family; assets like Google Fonts
+   or embedded external images are allowed through.) */
+function assetUrlOk(u, env) {
+  if (!u || (u.protocol !== 'https:' && u.protocol !== 'http:')) return false;
+  const h = u.hostname.toLowerCase();
+  if (isPrivateHost(h)) return false;
+  if (isAdDomain(h)) return false;
+  return true;
 }
 
-/* Re-host cookies onto the worker domain so logins survive. */
-function fixCookie(c, isHttps) {
-  const parts = String(c).split(';').map(p => p.trim()).filter(Boolean)
-    .filter(p => !/^(domain=|samesite=|secure$|partitioned$|priority=|sameparty$)/i.test(p));
-  if (!parts.some(p => /^path=/i.test(p))) parts.push('Path=/');
-  parts.push('SameSite=None');
-  if (isHttps) { parts.push('Secure'); parts.push('Partitioned'); }
-  return parts.join('; ');
-}
-
-function cleanHeaders(resHeaders, setCookies, isHttps) {
-  const h = new Headers();
-  resHeaders.forEach((v, k) => {
-    if (!STRIP_RESP_HEADERS.has(k.toLowerCase())) h.set(k, v);
+function decodeEnt(s) {
+  return String(s).replace(/&(#[0-9]+|#[xX][0-9a-fA-F]+|amp|lt|gt|quot|apos|nbsp);/g, (m, e) => {
+    if (e[0] === '#') {
+      const code = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      try { return String.fromCodePoint(code); } catch (err) { return m; }
+    }
+    const map = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
+    return map[e.toLowerCase()] || m;
   });
-  for (const c of setCookies) h.append('set-cookie', fixCookie(c, isHttps));
-  h.set('access-control-allow-origin', '*');
-  return h;
 }
 
-function fixCharset(ctype) {
-  if (/charset/i.test(ctype)) return ctype;
-  return ctype + (ctype.endsWith(';') ? ' ' : '; ') + 'charset=utf-8';
+function encodeEnt(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-/* ------------------------------------------------------------------ */
-/* URL rewriting                                                       */
-/* ------------------------------------------------------------------ */
+/* Attribute helpers that operate on a single tag string. */
+function attrVal(tag, name) {
+  const re = new RegExp('\\s' + name + '\\s*=\\s*("([^"]*)"|\'([^\']*)\'|([^\\s"\'>]+))', 'i');
+  const m = String(tag).match(re);
+  if (!m) return null;
+  return decodeEnt(m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : m[4]));
+}
 
-/* Turn an attribute / css url value into /raw/<host>/<path> or null. */
-function attrTarget(val, pageUrl, env) {
-  if (val == null) return null;
-  const v = String(val).trim();
+function setAttr(tag, name, val) {
+  const enc = encodeEnt(String(val));
+  const re = new RegExp('\\s' + name + '\\s*=\\s*("[^"]*"|\'[^\']*\'|[^\\s"\'>]+)', 'i');
+  if (re.test(tag)) return tag.replace(re, ' ' + name + '="' + enc + '"');
+  const tail = tag.match(/\s*\/?\s*>$/);
+  if (!tail) return tag;
+  const selfClose = /\/\s*>$/.test(tail[0]);
+  return tag.slice(0, tag.length - tail[0].length) + ' ' + name + '="' + enc + '"' + (selfClose ? '/>' : '>');
+}
+
+function removeAttr(tag, name) {
+  const re = new RegExp('\\s' + name + '\\s*=\\s*("[^"]*"|\'[^\']*\'|[^\\s"\'>]+)', 'i');
+  return tag.replace(re, '');
+}
+
+function absUrl(val, base) {
+  const v = String(val == null ? '' : val).trim();
   if (!v) return null;
-  if (/^\/raw\/[a-z0-9.-]+\//i.test(v)) return v; /* already worker-shaped */
-  if (/^(#|data:|blob:|javascript:|mailto:|tel:|about:|sms:|mms:|ftp:|itms)/i.test(v)) return null;
-  let u;
-  try { u = new URL(v, pageUrl); } catch (e) { return null; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-  if (!hostAllowed(u.hostname, env)) return null;
-  return '/raw/' + u.hostname + u.pathname + u.search + u.hash;
+  try {
+    const u = new URL(v, base);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.href;
+  } catch (e) { return null; }
 }
 
-/* Matches absolute / protocol-relative / JSON-escaped wikidot-family URLs
-   in free JS/JSON text. Lookahead avoids partial-host matches. */
-const HOST_TEXT_RE = /(?:(?:https?:)?\\?\/\\?\/)((?:[a-z0-9-]+\.)*(?:wikidot\.com|wdfiles\.com|scpwiki\.com)|d3g0gp89917ko\d\.cloudfront\.net)(?=[\s\\\/"'`#?&):;=,<\]}]|$)/gi;
-
-function textualPass(text) {
-  return String(text).replace(HOST_TEXT_RE, (m, h) => '/raw/' + h.toLowerCase());
+/* File-ish links (wikidot attachments) open through /api/asset, not
+   as pages. */
+function isFileLink(absHref) {
+  try {
+    const u = new URL(absHref);
+    const h = u.hostname.toLowerCase();
+    if (h === 'wdfiles.com' || h.endsWith('.wdfiles.com')) return true;
+    if (h === 'cdn.scpwiki.com') return true;
+    if (WIKIDOT_CDN_RE.test(h)) return true;
+    if (u.pathname.startsWith('/local--files/')) return true;
+  } catch (e) {}
+  return false;
 }
 
 function isAdTag(tagText, body) {
@@ -251,48 +220,6 @@ function isAdTag(tagText, body) {
   return AD_MARKERS_RE.test(String(tagText) + ' ' + String(body || ''));
 }
 
-function rewriteCss(css, pageUrl, env) {
-  css = String(css).replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, q, u) => {
-    const w = attrTarget(u.trim(), pageUrl, env);
-    return w ? 'url(' + q + w + q + ')' : m;
-  });
-  css = css.replace(/@import\s+(['"])([^'"]+)\1/gi, (m, q, u) => {
-    const w = attrTarget(u.trim(), pageUrl, env);
-    return w ? '@import ' + q + w + q : m;
-  });
-  return css;
-}
-
-/* JSON error helper - the worker is an API, so even errors are JSON. */
-function jsonErr(status, error, detail) {
-  const body = { ok: false, error: String(error || 'error') };
-  if (detail) body.detail = String(detail);
-  return new Response(JSON.stringify(body), {
-    status: status || 500,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-      'access-control-allow-origin': '*',
-      'x-scp-proxy': VERSION,
-    },
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* JSON API for the native reader app                                  */
-/*                                                                     */
-/*   GET /api/page/<wikidot path>   ->  { ok, status, host, path, html }     */
-/*        Fetches the wiki page upstream (following redirects), strips */
-/*        ads / scripts / trackers, returns the raw-ish HTML. The app  */
-/*        parses it client-side (DOMParser) and renders it natively -  */
-/*        wiki JS never runs on the phone.                             */
-/*   GET /api/search?q=<query>      ->  { ok, results:[{p,t,r}] }      */
-/*        Full-text search via the Crom GraphQL API.                   */
-/*   GET /api/random                ->  { ok, p, t }                   */
-/*        Random page via Crom (falls back to the 302 wiki route on    */
-/*        the app side if Crom is unreachable).                        */
-/* ------------------------------------------------------------------ */
-
 function json(obj, status, extra) {
   const h = {
     'content-type': 'application/json; charset=utf-8',
@@ -304,58 +231,388 @@ function json(obj, status, extra) {
   return new Response(JSON.stringify(obj), { status: status || 200, headers: h });
 }
 
-/* Strip everything the reader never needs: all scripts (wiki JS must not
-   run on the phone), link tags, iframes, base, CSP/refresh metas, SRI,
-   ad/tracker tags. Inline <style> blocks are KEPT (author CSS, the app
-   scopes them). Attribute URLs are left untouched - the app resolves
-   them against the real page URL and maps them to worker routes. */
-function apiSanitize(html) {
-  html = String(html);
-  html = html.replace(/<base\b[^>]*\/?>/gi, '');
-  html = html.replace(/\sintegrity\s*=\s*(?:"[^"]*"|'[^']*')/gi, '');
-  html = html.replace(/<meta\b[^>]*>/gi, m =>
-    /http-equiv\s*=\s*["']?(content-security-policy|refresh)/i.test(m) ? '' : m);
-  /* drop ad/tracker link + img + iframe tags first (keeps the check meaningful) */
-  html = html.replace(/<link\b[^>]*>/gi, m => (isAdTag(m) ? '' : m));
-  html = html.replace(/<img\b[^>]*>/gi, m => (isAdTag(m) ? '' : m));
-  html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>|<iframe\b[^>]*\/?>/gi, m => (isAdTag(m) ? '' : m));
-  /* then remove ALL scripts and links and iframes outright */
-  html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
-  html = html.replace(/<script\b[^>]*\/?>/gi, '');
-  html = html.replace(/<link\b[^>]*>/gi, '');
-  html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, '');
-  html = html.replace(/<iframe\b[^>]*\/?>/gi, '');
-  return html;
+function jsonErr(status, error, detail) {
+  const body = { ok: false, error: String(error || 'error') };
+  if (detail) body.detail = String(detail);
+  return json(body, status);
 }
 
-async function fetchWithTimeout(upstreamUrl, init) {
+async function fetchWithTimeout(url, init, ms) {
   return await Promise.race([
-    fetch(new Request(upstreamUrl, init)),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('upstream timeout after ' + UPSTREAM_TIMEOUT + 'ms')), UPSTREAM_TIMEOUT)),
+    fetch(new Request(url, init)),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('upstream timeout')), ms || UPSTREAM_TIMEOUT)),
   ]);
 }
 
-async function apiPage(request, env, ctx, url) {
+/* ------------------------------------------------------------------ */
+/* CSS fetching + inlining                                             */
+/* ------------------------------------------------------------------ */
+
+const CSS_CACHE = new Map();       /* url -> {at, text} raw css */
+const CSS_INFLIGHT = new Map();    /* url -> promise */
+const CSS_TTL = 6 * 3600 * 1000;
+const CSS_MAX = 300;
+
+function cssCacheTrim() {
+  if (CSS_CACHE.size <= CSS_MAX) return;
+  const keys = Array.from(CSS_CACHE.keys());
+  for (let i = 0; i < keys.length - CSS_MAX; i++) CSS_CACHE.delete(keys[i]);
+}
+
+async function fetchCssRaw(url) {
+  const hit = CSS_CACHE.get(url);
+  if (hit && Date.now() - hit.at < CSS_TTL) return hit.text;
+  const inflight = CSS_INFLIGHT.get(url);
+  if (inflight) return inflight;
+  const p = (async () => {
+    const res = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: { 'accept': 'text/css,*/*;q=0.1', 'user-agent': UA_MOBILE, 'referer': new URL(url).origin + '/' },
+      redirect: 'follow',
+    });
+    if (!res.ok) throw new Error('css http ' + res.status);
+    const ctype = res.headers.get('content-type') || '';
+    if (/html/i.test(ctype)) throw new Error('css endpoint returned html');
+    const text = await res.text();
+    CSS_CACHE.set(url, { at: Date.now(), text });
+    cssCacheTrim();
+    return text;
+  })();
+  CSS_INFLIGHT.set(url, p);
+  try { return await p; } finally { CSS_INFLIGHT.delete(url); }
+}
+
+/* Inline @import chains (server-side fetches) and tokenize url()
+   references. R supplies the per-render token registry. */
+async function inlineCss(css, base, env, R, depth) {
+  css = String(css);
+  /* 1. collect + resolve @imports (recursive) */
+  const imports = [];
+  css = css.replace(/@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)|(?:"([^"]*)"|'([^']*)'))([^;]*);/gi,
+    (m, g1, g2, g3, g4, g5) => {
+      const raw = g1 !== undefined ? g1 : (g2 !== undefined ? g2 : (g3 !== undefined ? g3 : (g4 !== undefined ? g4 : g5)));
+      const abs = raw != null ? absUrl(String(raw).trim(), base) : null;
+      if (!abs || !assetUrlOk(new URL(abs), env) || depth >= 4) return '/* scpw: import skipped */';
+      imports.push(abs);
+      return '\x00I' + (imports.length - 1) + '\x00';
+    });
+  if (imports.length) {
+    const texts = await Promise.all(imports.map(u =>
+      fetchCssRaw(u).then(t => inlineCss(t, u, env, R, depth + 1)).catch(() => null)));
+    for (let i = 0; i < imports.length; i++) {
+      css = css.split('\x00I' + i + '\x00').join(texts[i] == null ? '' : texts[i]);
+    }
+  }
+  /* 2. tokenize url() references (tokens from recursive imports are
+         already resolved - leave them alone) */
+  css = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)/gi, (m, dq, sq, uq) => {
+    const raw = dq !== undefined ? dq : (sq !== undefined ? sq : uq);
+    if (raw == null || !raw) return m;
+    const t = String(raw).trim();
+    if (/^(data:|about:)/i.test(t)) return m;
+    if (/^SCPW_A\d+$/.test(t)) return m;           /* already a token */
+    const abs = absUrl(t, base);
+    if (!abs || !assetUrlOk(new URL(abs), env)) return 'url("about:blank")';
+    return 'url("' + R.token(abs) + '")';
+  });
+  return css;
+}
+
+/* ------------------------------------------------------------------ */
+/* HTML render engine                                                  */
+/* ------------------------------------------------------------------ */
+
+const BRIDGE_SRC = "/* SCPW BRIDGE - injected into every rendered page by the worker.\n   Runs inside a sandboxed iframe (unique origin, scripts allowed).\n   Responsibilities:\n     - lazy-load images + CSS assets through the worker (/api/asset)\n     - report navigation clicks / form submits to the parent browser\n     - reimplement the wiki interactions that need JS (collapsibles,\n       tabviews) because the page's own scripts are stripped\n     - report scroll position + accept parent commands (scrollTo,\n       zoom, focus mode)\n   The worker appends an init call:  SCPW_INIT({w, a, u})   */\n\n(function () {\n  'use strict';\n\n  var CFG = null;          /* {w: worker origin, a: {token: url}, u: page url} */\n  var CACHE = {};          /* token -> blob url ('' = failed) */\n  var parentWin = window.parent;\n\n  function send(msg) {\n    try { parentWin.postMessage(msg, '*'); } catch (e) {}\n  }\n\n  /* ---------------- asset pipeline (through the worker) ---------------- */\n\n  function fetchAsset(url) {\n    return fetch(CFG.w + '/api/asset?url=' + encodeURIComponent(url), {\n      credentials: 'omit',\n    }).then(function (r) {\n      if (!r.ok) throw new Error('asset http ' + r.status);\n      return r.blob();\n    }).then(function (b) {\n      return URL.createObjectURL(b);\n    });\n  }\n\n  function resolveToken(tok) {\n    var c = CACHE[tok];\n    if (c !== undefined) return (c && typeof c.then === 'function') ? c : Promise.resolve(c);\n    var url = CFG.a[tok];\n    if (!url) return Promise.resolve('');\n    var p = fetchAsset(url).then(function (u) {\n      CACHE[tok] = u;\n      return u;\n    }, function () {\n      CACHE[tok] = '';\n      return '';\n    });\n    CACHE[tok] = p;\n    return p;\n  }\n\n  var TOKRE = /SCPW_A\\d+/g;\n\n  /* Images: placeholder src is a 1px gif; data-scpw holds the token. */\n  function swapImage(el) {\n    var tok = el.getAttribute('data-scpw');\n    if (!tok) return;\n    resolveToken(tok).then(function (u) {\n      if (u) {\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      } else {\n        el.classList.add('scpw-broken');\n      }\n      el.removeAttribute('data-scpw');\n    });\n  }\n\n  function activateImages() {\n    var imgs = document.querySelectorAll('img[data-scpw]');\n    var list = Array.prototype.slice.call(imgs);\n    var i = 0;\n    var io = null;\n    if ('IntersectionObserver' in window) {\n      io = new IntersectionObserver(function (entries) {\n        entries.forEach(function (e) {\n          if (e.isIntersecting) { io.unobserve(e.target); swapImage(e.target); }\n        });\n      }, { rootMargin: '600px 0px' });\n    }\n    list.forEach(function (el) {\n      if (!io || i < 3) swapImage(el);           /* first few eager */\n      else io.observe(el);\n      i++;\n    });\n  }\n\n  /* CSS: style elements still contain url(\"SCPW_A#\") tokens. */\n  function patchStyles() {\n    var styles = Array.prototype.slice.call(document.querySelectorAll('style'));\n    var needed = {};\n    styles.forEach(function (s) {\n      var found = String(s.textContent).match(TOKRE);\n      if (found) found.forEach(function (t) { needed[t] = 1; });\n    });\n    var toks = Object.keys(needed);\n    var active = 0, queue = toks.slice();\n    function next() {\n      while (active < 4 && queue.length) {\n        var t = queue.shift();\n        active++;\n        resolveToken(t).then(function (u) {\n          active--;\n          apply(t, u);\n          next();\n        });\n      }\n    }\n    function apply(tok, url) {\n      if (!url) url = 'about:blank';\n      styles.forEach(function (s) {\n        var txt = String(s.textContent);\n        if (txt.indexOf(tok) === -1) return;\n        try { s.textContent = txt.split(tok).join(url); } catch (e) {}\n      });\n    }\n    next();\n  }\n\n  /* ---------------- interactions the wiki JS used to provide ----------- */\n\n  function tabviewInit() {\n    document.querySelectorAll('.yui-navset').forEach(function (set) {\n      var lis = set.querySelectorAll('.yui-nav li');\n      var panes = set.querySelectorAll('.yui-content > div');\n      var anyOn = false;\n      for (var i = 0; i < panes.length; i++) { if (panes[i].classList.contains('scpw-on')) anyOn = true; }\n      if (!anyOn) { selectTab(set, 0); }\n    });\n  }\n\n  function selectTab(set, idx) {\n    var lis = set.querySelectorAll('.yui-nav li');\n    var panes = set.querySelectorAll('.yui-content > div');\n    for (var i = 0; i < lis.length; i++) {\n      lis[i].classList.toggle('selected', i === idx);\n      lis[i].classList.toggle('scpw-on', i === idx);\n    }\n    for (var j = 0; j < panes.length; j++) {\n      panes[j].classList.toggle('scpw-on', j === idx);\n      panes[j].classList.toggle('selected', j === idx);\n    }\n  }\n\n  function init() {\n    /* focus-mode styles + tabview styles + broken-image styles */\n    var css = document.createElement('style');\n    css.textContent =\n      'html.scpw-focus #navi-bar,html.scpw-focus #navi-bar-shadow,' +\n      'html.scpw-focus #header,html.scpw-focus #top-bar,' +\n      'html.scpw-focus #side-bar,html.scpw-focus #search-top-box,' +\n      'html.scpw-focus #login-status,html.scpw-focus #footer,' +\n      'html.scpw-focus #page-info,html.scpw-focus .page-tags,' +\n      'html.scpw-focus #footer-bar-below,html.scpw-focus #footer-below' +\n      '{display:none!important}' +\n      'html.scpw-focus #container-wrap{margin-top:0!important}' +\n      'html.scpw-focus #content-wrap{margin:0!important}' +\n      'html.scpw-focus #main-content{margin:0!important}' +\n      '.yui-navset .yui-content>div{display:none}' +\n      '.yui-navset .yui-content>div.scpw-on{display:block}' +\n      '.scpw-broken{opacity:.15!important}' +\n      'a.scpw-file::after{content:\" \\\\2193\";font-size:.8em;opacity:.6}';\n    (document.head || document.documentElement).appendChild(css);\n\n    tabviewInit();\n    activateImages();\n    patchStyles();\n    sendReady();\n  }\n\n  function sendReady() {\n    var d = document.documentElement;\n    send({\n      scpw: 'ready',\n      title: document.title || '',\n      url: CFG.u,\n      scrollH: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n      y: window.scrollY || 0,\n    });\n  }\n\n  /* ---------------- click routing (capture phase) ---------------- */\n\n  document.addEventListener('click', function (e) {\n    if (e.defaultPrevented) return;\n    var t = e.target;\n    var closest = (t && t.closest) ? t.closest.bind(t) : null;\n    if (!closest) return;\n\n    /* tabview tabs */\n    var tabLink = closest('.yui-nav a');\n    if (tabLink) {\n      var set = tabLink.closest('.yui-navset');\n      if (set) {\n        e.preventDefault(); e.stopPropagation();\n        var lis = set.querySelectorAll('.yui-nav li');\n        var li = tabLink.closest('li');\n        var idx = Array.prototype.indexOf.call(lis, li);\n        selectTab(set, idx < 0 ? 0 : idx);\n        return;\n      }\n    }\n\n    /* collapsible blocks */\n    var clps = closest('.collapsible-block-link');\n    if (clps) {\n      var block = clps.closest('.collapsible-block');\n      if (block) {\n        e.preventDefault(); e.stopPropagation();\n        var folded = block.querySelector('.collapsible-block-folded');\n        var unfolded = block.querySelector('.collapsible-block-unfolded');\n        if (folded && unfolded) {\n          var showFolded = unfolded.style.display === 'none' || !unfolded.style.display;\n          folded.style.display = showFolded ? '' : 'none';\n          unfolded.style.display = showFolded ? 'none' : '';\n        }\n        return;\n      }\n    }\n\n    /* file downloads (worker-marked) */\n    var fileLink = closest('a[data-scpw-file]');\n    if (fileLink) {\n      e.preventDefault(); e.stopPropagation();\n      send({ scpw: 'file', href: fileLink.getAttribute('data-scpw-file') });\n      return;\n    }\n\n    /* normal links */\n    var a = closest('a[href]');\n    if (!a) return;\n    var href = a.getAttribute('href') || '';\n    if (!href) return;\n    if (href.charAt(0) === '#') return;             /* in-page anchor: native */\n    if (/^(javascript|mailto|tel|sms|about|data|blob):/i.test(href)) {\n      e.preventDefault();\n      if (/^mailto:|^tel:/i.test(href)) send({ scpw: 'ext', href: href, kind: 'contact' });\n      return;\n    }\n    e.preventDefault();\n    send({ scpw: 'nav', href: href });\n  }, true);\n\n  /* ---------------- forms (GET becomes navigation) ---------------- */\n\n  document.addEventListener('submit', function (e) {\n    var f = e.target;\n    if (!f || !f.tagName || f.tagName.toUpperCase() !== 'FORM') return;\n    e.preventDefault(); e.stopPropagation();\n    var method = (f.getAttribute('method') || 'get').toLowerCase();\n    var action = f.getAttribute('action') || CFG.u;\n    if (method !== 'get') {\n      send({ scpw: 'blocked', reason: 'post', href: action });\n      return;\n    }\n    try {\n      var qs = new URLSearchParams();\n      new FormData(f).forEach(function (v, k) {\n        if (typeof v === 'string') qs.append(k, v);\n      });\n      var q = qs.toString();\n      send({ scpw: 'nav', href: action + (q ? (action.indexOf('?') > -1 ? '&' : '?') + q : '') });\n    } catch (err) {\n      send({ scpw: 'blocked', reason: 'form', href: action });\n    }\n  }, true);\n\n  /* ---------------- scroll reporting ---------------- */\n\n  var lastSent = 0;\n  function reportScroll(force) {\n    var now = Date.now();\n    if (!force && now - lastSent < 250) return;\n    lastSent = now;\n    var d = document.documentElement;\n    send({\n      scpw: 'scroll',\n      y: Math.round(window.scrollY || document.body.scrollTop || 0),\n      h: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n    });\n  }\n  window.addEventListener('scroll', function () { reportScroll(false); }, { passive: true });\n\n  /* ---------------- parent commands ---------------- */\n\n  window.addEventListener('message', function (e) {\n    var d = e.data;\n    if (!d || d.scpw !== 'cmd') return;\n    if (d.op === 'scrollTo') {\n      window.scrollTo(0, d.y || 0);\n    } else if (d.op === 'anchor') {\n      var id = String(d.a || '').replace(/^#/, '');\n      if (id) {\n        var el = document.getElementById(id);\n        if (!el) {\n          var named = document.getElementsByName(id);\n          if (named && named.length) el = named[0];\n        }\n        if (el && el.scrollIntoView) el.scrollIntoView(true);\n        else window.scrollTo(0, 0);\n      }\n    } else if (d.op === 'zoom') {\n      document.body.style.zoom = d.z || 1;\n      var vp = document.querySelector('meta[name=viewport]');\n      if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1');\n    } else if (d.op === 'focus') {\n      document.documentElement.classList.toggle('scpw-focus', !!d.on);\n    } else if (d.op === 'ping') {\n      sendReady();\n    } else if (d.op === 'top') {\n      window.scrollTo(0, 0);\n    }\n  });\n\n  /* ---------------- boot ---------------- */\n\n  window.SCPW_INIT = function (cfg) {\n    CFG = cfg || {};\n    if (document.readyState === 'loading') {\n      document.addEventListener('DOMContentLoaded', function () { init(); });\n    } else {\n      init();\n    }\n  };\n})();\n";
+
+function makeRewriter(finalUrl) {
+  const R = {
+    base: finalUrl,
+    noFragBase: String(finalUrl).split('#')[0],
+    map: {},          /* token -> absolute asset url */
+    n: 0,
+    title: '',
+    icon: '',
+    token(abs) {
+      for (const k in this.map) if (this.map[k] === abs) return k;
+      const t = 'SCPW_A' + (this.n++);
+      this.map[t] = abs;
+      return t;
+    },
+  };
+  return R;
+}
+
+/* The full document pipeline. Returns the rewritten HTML string. */
+async function rewriteDocument(html, R, env, workerOrigin) {
+  html = String(html);
+
+  /* --- 1. remove ALL scripts (the page's JS never runs client-side) --- */
+  html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>|<script\b[^>]*\/?>/gi, '');
+
+  /* --- 2. remove framed / embedded / base / noscript / media sources --- */
+  html = html.replace(/<(iframe|object|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+  html = html.replace(/<\/?(iframe|object|embed|noscript|base|frame|frameset|applet|source|track|template)\b[^>]*\/?>/gi, '');
+
+  /* --- 3. remove ad / tracker img + link tags + empty ad-holder divs --- */
+  html = html.replace(/<img\b[^>]*\/?>/gi, m => (isAdTag(m) ? '' : m));
+  html = html.replace(/<link\b[^>]*\/?>/gi, m => (isAdTag(m) ? '' : m));
+  html = html.replace(/<div\b[^>]*\bid="(confiant_tag_holder|wad-\d+|atContainer|ad-container|ad-slot)"[^>]*>\s*<\/div>/gi, '');
+
+  /* --- 4. strip inline event handlers + srcset --- */
+  html = html.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  html = html.replace(/\ssrcset\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+
+  /* --- 5. remove refresh / CSP metas --- */
+  html = html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy[^>]*>/gi, '');
+  html = html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh[^>]*>/gi, '');
+
+  /* --- 6. collect <style> blocks + stylesheet links; drop other links ---
+         Placeholders use \x00 sentinels that never appear in real HTML
+         and are fully replaced before the document is returned. */
+  const styleJobs = [];   /* {attrs, css, media} for inline blocks */
+  const linkJobs = [];    /* {href} for stylesheet links */
+  html = html.replace(/<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi, (m, attrs, css) => {
+    if (/\bncmp|onesignal\b/i.test(css)) return '';      /* dead consent-banner css */
+    styleJobs.push({ attrs: attrs || '', css });
+    return '\x00S' + (styleJobs.length - 1) + '\x00';
+  });
+  html = html.replace(/<link\b[^>]*\/?>/gi, (tag) => {
+    const rel = attrVal(tag, 'rel') || '';
+    if (/\bstylesheet\b/i.test(rel)) {
+      const href = attrVal(tag, 'href');
+      if (href) {
+        linkJobs.push({ href, media: attrVal(tag, 'media') || '' });
+        return '\x00L' + (linkJobs.length - 1) + '\x00';
+      }
+      return '';
+    }
+    if (!R.icon && /\bicon\b/i.test(rel) && !/apple-touch/i.test(rel)) {
+      const href = attrVal(tag, 'href');
+      const abs = href ? absUrl(href, R.base) : null;
+      if (abs && assetUrlOk(new URL(abs), env)) R.icon = abs;
+    }
+    return ''; /* manifest, prefetch, alternate, icons... not needed */
+  });
+
+  /* --- 7. process all css (style blocks + fetched link stylesheets) --- */
+  const processed = await Promise.all(styleJobs.map(j =>
+    inlineCss(j.css, R.base, env, R, 0).catch(() => j.css)));
+  const linkCss = await Promise.all(linkJobs.map(j => {
+    const abs = absUrl(j.href, R.base);
+    if (!abs || !assetUrlOk(new URL(abs), env)) return Promise.resolve(null);
+    return fetchCssRaw(abs)
+      .then(t => inlineCss(t, abs, env, R, 0))
+      .catch(() => null);
+  }));
+
+  /* --- 8. splice processed css back in, in document order --- */
+  styleJobs.forEach((j, i) => {
+    let tag = '<style' + (j.attrs || '') + '>';
+    if (j.media) tag = '<style media="' + encodeEnt(j.media) + '">';
+    html = html.split('\x00S' + i + '\x00').join(tag + processed[i] + '</style>');
+  });
+  linkJobs.forEach((j, i) => {
+    const txt = linkCss[i];
+    if (txt == null) {
+      html = html.split('\x00L' + i + '\x00').join('');
+      return;
+    }
+    const media = j.media ? ' media="' + encodeEnt(j.media) + '"' : '';
+    html = html.split('\x00L' + i + '\x00').join('<style' + media + '>' + txt + '</style>');
+  });
+
+  /* --- 9. images -> token placeholders + 1px gif --- */
+  html = html.replace(/<img\b[^>]*\/?>/gi, (tag) => {
+    if (isAdTag(tag)) return '';
+    const src = attrVal(tag, 'src');
+    let out = tag;
+    if (src != null && !/^(data|blob):/i.test(src)) {
+      const abs = absUrl(src, R.base);
+      if (abs && assetUrlOk(new URL(abs), env)) {
+        out = setAttr(out, 'src', PX_GIF);
+        out = setAttr(out, 'data-scpw', R.token(abs));
+      } else {
+        out = setAttr(out, 'src', PX_GIF);
+      }
+    }
+    out = setAttr(out, 'decoding', 'async');
+    return out;
+  });
+
+  /* --- 10. links: absolutize / fragment / file / javascript --- */
+  html = html.replace(/<a\b[^>]*\/?>/gi, (tag) => {
+    let out = removeAttr(tag, 'target');
+    const href = attrVal(out, 'href');
+    if (href == null) return out;
+    if (/^javascript:/i.test(href)) return removeAttr(out, 'href');
+    if (/^(#|mailto:|tel:|sms:)/i.test(href)) return out;
+    const abs = absUrl(href, R.base);
+    if (!abs) return out;
+    const noFrag = abs.split('#')[0];
+    if (noFrag === R.noFragBase && abs.indexOf('#') > -1) {
+      return setAttr(out, 'href', abs.slice(abs.indexOf('#')));
+    }
+    if (isFileLink(abs)) {
+      out = removeAttr(out, 'href');
+      out = setAttr(out, 'data-scpw-file', abs);
+      out = setAttr(out, 'class', (attrVal(out, 'class') || '') + ' scpw-file');
+      return out;
+    }
+    return setAttr(out, 'href', abs);
+  });
+  html = html.replace(/<area\b[^>]*\/?>/gi, (tag) => {
+    const href = attrVal(tag, 'href');
+    if (href == null) return tag;
+    const abs = absUrl(href, R.base);
+    return abs ? setAttr(tag, 'href', abs) : tag;
+  });
+
+  /* --- 11. forms: absolutize action --- */
+  html = html.replace(/<form\b[^>]*\/?>/gi, (tag) => {
+    const action = attrVal(tag, 'action');
+    if (action == null) return tag;
+    const abs = absUrl(action, R.base);
+    return abs ? setAttr(tag, 'action', abs) : tag;
+  });
+
+  /* --- 12. inline style attributes: tokenize url() --- */
+  html = html.replace(/\sstyle\s*=\s*("([^"]*)"|'([^']*)')/gi, (m, all, dq, sq) => {
+    const css = dq !== undefined ? dq : sq;
+    const fixed = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)/gi, (mm, d2, s2, u2) => {
+      const raw = d2 !== undefined ? d2 : (s2 !== undefined ? s2 : u2);
+      if (raw == null || !raw || /^data:/i.test(raw)) return mm;
+      const abs = absUrl(String(raw).trim(), R.base);
+      if (!abs || !assetUrlOk(new URL(abs), env)) return mm;
+      return 'url("' + R.token(abs) + '")';
+    });
+    if (fixed === css) return m;
+    return ' style="' + encodeEnt(fixed) + '"';
+  });
+
+  /* --- 13. title --- */
+  const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title\s*>/i);
+  if (tm) R.title = decodeEnt(tm[1].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+
+  /* --- 14. viewport insurance --- */
+  if (!/<meta\b[^>]*name\s*=\s*["']?viewport/i.test(html)) {
+    html = html.replace(/<\/head\s*>/i, '<meta name="viewport" content="width=device-width, initial-scale=1"></head>');
+  }
+
+  /* --- 15. inject the bridge + its init (worker origin, asset map) --- */
+  const cfg = JSON.stringify({ w: workerOrigin, a: R.map, u: R.base }).replace(/</g, '\\u003c');
+  const inject = '<script>' + BRIDGE_SRC + '</scr' + 'ipt>' +
+    '<script>SCPW_INIT(' + cfg + ')</scr' + 'ipt>';
+  const idx = html.toLowerCase().lastIndexOf('</body');
+  if (idx > -1) html = html.slice(0, idx) + inject + html.slice(idx);
+  else html += inject;
+
+  return html;
+}
+
+/* ------------------------------------------------------------------ */
+/* /api/render                                                         */
+/* ------------------------------------------------------------------ */
+
+const PAGE_CACHE = new Map();      /* key -> {at, pkg} */
+const PAGE_INFLIGHT = new Map();
+const PAGE_TTL = 5 * 60 * 1000;
+const PAGE_MAX = 25;
+
+function pageCacheTrim() {
+  if (PAGE_CACHE.size <= PAGE_MAX) return;
+  const keys = Array.from(PAGE_CACHE.keys());
+  for (let i = 0; i < keys.length - PAGE_MAX; i++) PAGE_CACHE.delete(keys[i]);
+}
+
+async function buildRender(targetUrl, env, workerOrigin) {
+  const tu = new URL(targetUrl);
+  const upstream = 'https://' + tu.hostname + tu.pathname + tu.search;
+
+  /* Follow redirects ourselves so the final URL is exact (and external
+     redirects are caught instead of silently followed). */
+  let current = upstream;
+  let res;
+  for (let hop = 0; ; hop++) {
+    if (hop >= 8) { const e = new Error('too many redirects'); e.status = 508; throw e; }
+    res = await fetchWithTimeout(current, {
+      method: 'GET',
+      headers: {
+        'accept': 'text/html,application/xhtml+xml',
+        'accept-language': 'en',
+        'user-agent': UA_MOBILE,
+      },
+      redirect: 'manual',
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      let next;
+      try { next = new URL(loc, current); } catch (e) { break; }
+      if (next.protocol !== 'https:' && next.protocol !== 'http:') break;
+      if (!hostAllowed(next.hostname, env)) {
+        const e = new Error('redirect leaves the scp network');
+        e.status = 403;
+        throw e;
+      }
+      current = next.protocol === 'https:' ? next.href : 'https://' + next.hostname + next.pathname + next.search;
+      continue;
+    }
+    break;
+  }
+
+  const ctype = (res.headers.get('content-type') || '').toLowerCase();
+  if (!ctype.includes('text/html') && !ctype.includes('application/xhtml')) {
+    const err = new Error('not an html page');
+    err.status = 415;
+    throw err;
+  }
+  const cl = +(res.headers.get('content-length') || 0);
+  if (cl && cl > MAX_HTML) {
+    const err = new Error('page too large');
+    err.status = 413;
+    throw err;
+  }
+  const html = await res.text();
+  if (html.length > MAX_HTML) {
+    const err = new Error('page too large');
+    err.status = 413;
+    throw err;
+  }
+
+  const finalUrl = current;
+  const R = makeRewriter(finalUrl);
+  const out = await rewriteDocument(html, R, env, workerOrigin);
+
+  return {
+    ok: true,
+    url: upstream,
+    finalUrl: finalUrl,
+    title: R.title,
+    icon: R.icon,
+    html: out,
+    assets: R.map,
+    status: res.status,
+  };
+}
+
+async function apiRender(request, env, ctx, url) {
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return json({ ok: false, error: 'GET only' }, 405);
   }
-  /* Optional ?host= lets the reader open sibling wikis (scp-int, cn...)
-     in-app. Still only the allowlisted family, still API-only. */
-  let site = (url.searchParams.get('host') || '').trim().toLowerCase().replace(/\/+$/, '');
-  if (site) {
-    if (!hostAllowed(site, env)) {
-      return json({ ok: false, error: 'host not allowed', detail: site }, 403);
-    }
-  } else {
-    site = defaultSite(env);
+  const targetRaw = url.searchParams.get('url');
+  if (!targetRaw) return json({ ok: false, error: 'missing url parameter' }, 400);
+  let tu;
+  try { tu = new URL(targetRaw); } catch (e) { return json({ ok: false, error: 'bad url' }, 400); }
+  if (tu.protocol !== 'http:' && tu.protocol !== 'https:') {
+    return json({ ok: false, error: 'only http/https pages can be rendered' }, 400);
   }
-  /* Path after /api/page (keeps its percent-encoding), plus query string. */
-  let raw = url.pathname.slice('/api/page'.length) || '/';
-  if (!raw.startsWith('/')) raw = '/' + raw;
+  if (!hostAllowed(tu.hostname, env)) {
+    return json({ ok: false, error: 'page host not allowed', detail: tu.hostname }, 403);
+  }
 
-  /* Short edge-side cache: pages rarely change; 5 minutes is fresh enough
-     for a reader and makes repeats instant. */
-  const cacheKey = url.origin + '/api/page' + raw + url.search;
+  const cacheKey = url.origin + '/api/render?url=' + encodeURIComponent(targetRaw.split('#')[0]);
+
+  /* edge cache */
   if (request.method === 'GET' && typeof caches !== 'undefined') {
     try {
       const hit = await caches.default.match(new Request(cacheKey, { method: 'GET' }));
@@ -367,58 +624,111 @@ async function apiPage(request, env, ctx, url) {
     } catch (e) {}
   }
 
-  /* strip our own ?host= param so it never reaches the upstream site */
-  let upstreamSearch = url.search;
-  if (url.searchParams.has('host')) {
-    const qp = new URLSearchParams(url.search);
-    qp.delete('host');
-    upstreamSearch = qp.toString();
-    if (upstreamSearch) upstreamSearch = '?' + upstreamSearch;
+  /* memory cache */
+  const mem = PAGE_CACHE.get(cacheKey);
+  if (mem && Date.now() - mem.at < PAGE_TTL) {
+    return json(mem.pkg, 200, { 'cache-control': 'public, max-age=120', 'x-scp-cache': 'mem' });
   }
-  let upstreamUrl;
+
+  /* in-flight dedupe */
+  const inflight = PAGE_INFLIGHT.get(cacheKey);
+  if (inflight) {
+    try {
+      return json(await inflight, 200, { 'cache-control': 'public, max-age=120' });
+    } catch (e) {
+      return json({ ok: false, error: (e && e.message) || 'upstream error' }, (e && e.status) || 502);
+    }
+  }
+
+  const p = buildRender(tu.href, env, url.origin)
+    .then(pkg => {
+      PAGE_CACHE.set(cacheKey, { at: Date.now(), pkg });
+      pageCacheTrim();
+      return pkg;
+    });
+  PAGE_INFLIGHT.set(cacheKey, p);
   try {
-    upstreamUrl = new URL('https://' + site + raw + upstreamSearch);
+    const pkg = await p;
+    const out = json(pkg, 200, { 'cache-control': 'public, max-age=120' });
+    if (ctx && typeof caches !== 'undefined') {
+      try { ctx.waitUntil(caches.default.put(new Request(cacheKey, { method: 'GET' }), out.clone())); } catch (e) {}
+    }
+    return out;
   } catch (e) {
-    return json({ ok: false, error: 'bad path' }, 400);
+    const status = (e && e.status) || 502;
+    return json({ ok: false, error: (e && e.message) || 'upstream error' }, status);
+  } finally {
+    PAGE_INFLIGHT.delete(cacheKey);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* /api/asset                                                          */
+/* ------------------------------------------------------------------ */
+
+async function apiAsset(request, env, ctx, url) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return json({ ok: false, error: 'GET only' }, 405);
+  }
+  const targetRaw = url.searchParams.get('url');
+  if (!targetRaw) return json({ ok: false, error: 'missing url parameter' }, 400);
+  let tu;
+  try { tu = new URL(targetRaw); } catch (e) { return json({ ok: false, error: 'bad url' }, 400); }
+  if (tu.protocol !== 'http:' && tu.protocol !== 'https:') {
+    return json({ ok: false, error: 'only http/https assets' }, 400);
+  }
+  if (!assetUrlOk(tu, env)) {
+    return json({ ok: false, error: 'asset host not allowed', detail: tu.hostname }, 403);
+  }
+
+  const upstream = 'https://' + tu.hostname + tu.pathname + tu.search;
+  const cacheKey = url.origin + '/api/asset?url=' + encodeURIComponent(targetRaw.split('#')[0]);
+
+  if (request.method === 'GET' && typeof caches !== 'undefined') {
+    try {
+      const hit = await caches.default.match(new Request(cacheKey, { method: 'GET' }));
+      if (hit) {
+        const h = new Headers(hit.headers);
+        h.set('x-scp-cache', 'hit');
+        return new Response(hit.body, { status: hit.status, headers: h });
+      }
+    } catch (e) {}
   }
 
   let res;
   try {
-    res = await fetchWithTimeout(upstreamUrl, {
-      method: 'GET',
+    res = await fetchWithTimeout(upstream, {
+      method: request.method,
       headers: {
-        'accept': 'text/html,application/xhtml+xml',
-        'accept-language': 'en',
-        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        'accept': 'image/*,font/*,text/css,*/*;q=0.8',
+        'user-agent': UA_MOBILE,
+        'referer': tu.origin + '/',
       },
       redirect: 'follow',
     });
   } catch (e) {
-    return json({ ok: false, error: 'upstream unreachable', detail: String((e && e.message) || e) }, 502);
+    return json({ ok: false, error: 'asset unreachable', detail: String((e && e.message) || e) }, 502);
   }
-
-  /* Follow redirect chains give us the final URL (e.g. /random:random-scp). */
-  let finalPath = raw;
-  try {
-    const fu = new URL(res.url || upstreamUrl.href);
-    finalPath = fu.pathname + fu.search || '/';
-  } catch (e) {}
 
   const ctype = (res.headers.get('content-type') || '').toLowerCase();
-  if (!ctype.includes('text/html') && !ctype.includes('application/xhtml')) {
-    return json({ ok: false, error: 'not a wiki page', status: res.status, path: finalPath }, 415);
+  if (ctype.includes('text/html') || ctype.includes('application/xhtml')) {
+    return json({ ok: false, error: 'html not proxied', detail: 'assets only - pages come from /api/render' }, 415);
   }
+  const cl = +(res.headers.get('content-length') || 0);
+  if (cl && cl > MAX_ASSET) return json({ ok: false, error: 'asset too large' }, 413);
 
-  const html = apiSanitize(await res.text());
-  const out = json({
-    ok: true,
-    status: res.status,
-    host: site,
-    path: finalPath,
-    html: html,
-  }, 200, { 'cache-control': 'public, max-age=300' });
+  const h = new Headers();
+  const keep = ['content-type', 'etag', 'last-modified', 'content-range', 'accept-ranges', 'content-disposition'];
+  keep.forEach(k => { const v = res.headers.get(k); if (v != null) h.set(k, v); });
+  if (!h.has('content-type')) h.set('content-type', 'application/octet-stream');
+  h.set('access-control-allow-origin', '*');
+  h.set('cache-control', 'public, max-age=86400');
+  h.set('x-scp-proxy', VERSION);
 
-  if (request.method === 'GET' && res.status === 200 && typeof caches !== 'undefined' && ctx) {
+  if (request.method === 'HEAD') return new Response(null, { status: res.status, headers: h });
+
+  const out = new Response(res.body, { status: res.status, headers: h });
+  if (res.status === 200 && ctx && typeof caches !== 'undefined' && /image\/|font\/|text\/css/.test(ctype)) {
     try {
       ctx.waitUntil(caches.default.put(new Request(cacheKey, { method: 'GET' }), out.clone()));
     } catch (e) {}
@@ -426,7 +736,10 @@ async function apiPage(request, env, ctx, url) {
   return out;
 }
 
-/* Crom GraphQL helpers (search + random). */
+/* ------------------------------------------------------------------ */
+/* Crom GraphQL helpers (search + random)                              */
+/* ------------------------------------------------------------------ */
+
 async function cromQuery(query, variables) {
   const res = await Promise.race([
     fetch(CROM_GRAPHQL, {
@@ -511,13 +824,13 @@ async function handle(request, env, ctx) {
         site: defaultSite(env),
         api: true,
         endpoints: {
-          page: '/api/page/<wiki-path>[?host=<wiki-host>]',
+          render: '/api/render?url=<absolute-wiki-page-url>',
+          asset: '/api/asset?url=<absolute-asset-url>',
           search: '/api/search?q=<query>',
           random: '/api/random',
-          asset: '/raw/<host>/<path>',
           ping: '/__worker/ping',
         },
-        note: 'API-only worker - no pages are served here. The reader app is the separate single-file scp-reader.html.',
+        note: 'API-only worker - no pages are served here. The browser app is the separate single-file scp-browser.html; it renders real wiki pages fetched through /api/render.',
       });
       return new Response(request.method === 'HEAD' ? null : body, {
         status: 200,
@@ -537,147 +850,18 @@ async function handle(request, env, ctx) {
       return new Response('method not allowed', { status: 405, headers: { allow: 'GET, HEAD, POST' } });
     }
 
-    /* ---------------- JSON API (the reader app talks to these) -------------
-       The phone ONLY ever calls these worker endpoints; the worker does all
-       upstream fetching. No wiki URL is ever contacted from the phone.       */
-    if (url.pathname === '/api/page' || url.pathname.startsWith('/api/page/')) {
-      return await apiPage(request, env, ctx, url);
-    }
+    /* ---------------- JSON API (the browser app talks to these) --------
+       The phone ONLY ever calls these worker endpoints; the worker does
+       all upstream fetching. No wiki URL is ever contacted from the
+       phone.                                                                    */
+    if (url.pathname === '/api/render') return await apiRender(request, env, ctx, url);
+    if (url.pathname === '/api/asset') return await apiAsset(request, env, ctx, url);
     if (url.pathname === '/api/search') return await apiSearch(request, env, url);
     if (url.pathname === '/api/random') return await apiRandom(request, env);
 
-    /* Explicit /raw/ asset routes only. Unknown bare paths are NOT
-       proxied (v2.1: no site mirroring, no referer guesswork). */
-    const target = parseRaw(url.pathname);
-    if (target) {
-      if (!hostAllowed(target.host, env)) {
-        return jsonErr(403, 'host not allowed',
-          'This worker only proxies the SCP Wiki / Wikidot family of sites. Requested host: ' + target.host);
-      }
-      return await proxy(request, env, ctx, target, url);
-    }
-
     return jsonErr(404, 'unknown endpoint',
-      'This worker is API-only. Try /api/page/<wiki-path>, /api/search?q=, /api/random, /raw/<host>/<path> or /__worker/ping.');
+      'This worker is API-only. Try /api/render?url=, /api/asset?url=, /api/search?q=, /api/random or /__worker/ping.');
   } catch (e) {
     return jsonErr(500, 'worker error', String((e && e.message) || e));
   }
-}
-
-/* ------------------------------------------------------------------ */
-/* Proxy core                                                          */
-/* ------------------------------------------------------------------ */
-async function proxy(request, env, ctx, target, url) {
-  const isHttps = url.protocol === 'https:';
-  let upstreamUrl;
-  try {
-    upstreamUrl = new URL('https://' + target.host + target.path + url.search);
-  } catch (e) {
-    return jsonErr(400, 'bad upstream URL', String(e.message || e));
-  }
-
-  let body;
-  if (request.method === 'POST') {
-    const cl = +(request.headers.get('content-length') || 0);
-    if (cl > MAX_BODY) return new Response('payload too large', { status: 413 });
-    body = await request.arrayBuffer();
-  }
-
-  const upReq = new Request(upstreamUrl.href, {
-    method: request.method,
-    headers: upstreamHeaders(request, upstreamUrl),
-    body: body,
-    redirect: 'manual',
-  });
-
-  /* Cache lookup for GET static assets. */
-  if (request.method === 'GET' && typeof caches !== 'undefined') {
-    try {
-      const hit = await caches.default.match(new Request(url.origin + url.pathname + url.search, { method: 'GET' }));
-      if (hit) {
-        const h = new Headers(hit.headers);
-        h.set('x-scp-cache', 'hit');
-        return new Response(hit.body, { status: hit.status, headers: h });
-      }
-    } catch (e) {}
-  }
-
-  let res;
-  try {
-    res = await Promise.race([
-      fetch(upReq),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('upstream timeout after ' + UPSTREAM_TIMEOUT + 'ms')), UPSTREAM_TIMEOUT)),
-    ]);
-  } catch (e) {
-    return jsonErr(502, 'upstream unreachable',
-      'The worker could not fetch https://' + upstreamUrl.host + ' - ' + String((e && e.message) || e));
-  }
-
-  /* Follow redirects ourselves so Location can be rewritten. */
-  if (res.status >= 300 && res.status < 400) {
-    const out = new Headers({ 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
-    const loc = res.headers.get('location');
-    if (loc) {
-      try {
-        const abs = new URL(loc, upstreamUrl);
-        const pr = parseRaw(abs.pathname);
-        if (pr && hostAllowed(pr.host, env)) {
-          out.set('location', abs.pathname + abs.search + abs.hash); /* already worker-shaped */
-        } else if (hostAllowed(abs.hostname, env)) {
-          out.set('location', '/raw/' + abs.hostname + abs.pathname + abs.search + abs.hash);
-        } else {
-          out.set('location', abs.href); /* external: let the browser leave */
-        }
-      } catch (e) { /* leave Location untouched */ }
-    }
-    /* Cookies set alongside a redirect (login flows) must survive. */
-    for (const c of getSetCookies(res)) {
-      out.append('set-cookie', fixCookie(c, isHttps));
-    }
-    return new Response(null, { status: res.status, headers: out });
-  }
-
-  const setCookies = getSetCookies(res);
-  const headers = cleanHeaders(res.headers, setCookies, isHttps);
-  const ctype = (res.headers.get('content-type') || '').toLowerCase();
-
-  if (request.method === 'HEAD') {
-    return new Response(null, { status: res.status, headers });
-  }
-
-  const isHtml = ctype.includes('text/html') || ctype.includes('application/xhtml');
-  /* v2.1: /raw/ is an ASSET proxy - HTML pages are never mirrored or
-     rendered by this worker. The reader renders pages itself from
-     /api/page. Opening a /raw/ page URL just returns this JSON notice. */
-  if (isHtml) {
-    return jsonErr(res.status >= 400 ? res.status : 415, 'html not proxied',
-      'This worker serves assets + JSON only. Pages come from /api/page/<path> and are rendered by the reader app.');
-  }
-  const isCss = ctype.includes('text/css');
-  const isTextual = isCss || /javascript|ecmascript|json/.test(ctype) || ctype.startsWith('text/');
-
-  if (isTextual) {
-    const cl = +(res.headers.get('content-length') || 0);
-    if (cl && cl > MAX_TEXT) {
-      return new Response(res.body, { status: res.status, headers });
-    }
-    const text = await res.text();
-    const out = isCss ? rewriteCss(text, upstreamUrl, env) : textualPass(text);
-    headers.set('content-type', fixCharset(ctype || 'text/plain'));
-    headers.delete('etag');
-    headers.delete('last-modified');
-    headers.set('cache-control', 'no-cache');
-    return new Response(out, { status: res.status, headers });
-  }
-
-  /* Binary: stream through, optionally cached. */
-  const outRes = new Response(res.body, { status: res.status, headers });
-  if (request.method === 'GET' && res.status === 200 && setCookies.length === 0
-    && CACHEABLE_CT.test(ctype) && typeof caches !== 'undefined' && ctx) {
-    try {
-      const key = new Request(url.origin + url.pathname + url.search, { method: 'GET' });
-      ctx.waitUntil(caches.default.put(key, outRes.clone()));
-    } catch (e) {}
-  }
-  return outRes;
 }

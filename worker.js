@@ -1,23 +1,35 @@
-/* SCP WIKI WORKER - Cloudflare Worker proxy for the SCP Wiki (Wikidot family)
-   Deploy: dash.cloudflare.com -> Workers & Pages -> Create Worker -> paste this file -> Deploy.
-   Then paste the worker URL into the SCP Reader app.
+/* SCP WIKI WORKER - Cloudflare Worker: pure JSON API + asset proxy for the
+   SCP Wiki. Deploy: dash.cloudflare.com -> Workers & Pages -> Create Worker
+   -> paste this file -> Deploy (from any device that can open the dashboard).
+   Opening the worker URL shows a small JSON status object - that is expected:
+   this worker serves NO pages. The reader app is the separate single-file
+   scp-reader.html, which talks only to this worker's API (/api/page,
+   /api/search, /api/random, /raw/ for images and files).
    Optional env vars: DEFAULT_SITE, EXTRA_HOSTS (comma-separated extra hosts). */
 
 /* =====================================================================
-   SCP WIKI WORKER - Cloudflare Worker proxy for the SCP Wiki (Wikidot)
+   SCP WIKI WORKER - Cloudflare Worker: pure JSON API + asset proxy
    =====================================================================
    Purpose:
-     Routes every byte of scp-wiki.wikidot.com (and the whole Wikidot
-     asset family) through YOUR Cloudflare Worker, so the single-file
-     mobile reader can browse the wiki entirely via the worker.
+     Lets the single-file mobile reader (scp-reader.html) browse the SCP
+     Wiki through YOUR worker, so the phone never contacts
+     scp-wiki.wikidot.com - everything arrives via this API.
+
+   This worker deliberately serves NO web pages of its own (v2.1): it is
+   an API only. Opening the worker URL shows a small JSON status object -
+   that is expected. The reading experience lives in scp-reader.html.
 
    URL scheme (what the worker serves):
-     /raw/<host>/<path>?<query>  ->  proxied https://<host>/<path>?<query>
-     /__worker/ping              ->  health-check JSON (used by the reader)
-     <anything>/<anything>       ->  resolved via the Referer header when the
-                                     request comes from an already-proxied page
-                                     (this is how relative JS/XHR URLs work),
-                                     otherwise 302 to /raw/<default site>/...
+     /  (and /__worker/ping)      ->  JSON status + endpoint list
+     /api/page/<wikidot path>     ->  JSON { ok, status, host, path, html }
+                                      (redirects followed upstream, ads +
+                                      scripts + trackers stripped)
+     /api/page/<path>?host=<wiki> ->  same, for sibling wikis (scp-int...)
+     /api/search?q=               ->  JSON search results (Crom GraphQL)
+     /api/random                  ->  JSON random page (Crom GraphQL)
+     /raw/<host>/<path>?<query>   ->  proxied ASSETS (images, css, files).
+                                      HTML pages are never mirrored.
+     anything else                ->  JSON 404 with the endpoint list
 
    Security:
      Only the Wikidot / SCP host family is proxied. It is NOT an open proxy.
@@ -25,16 +37,19 @@
 
    Deploy:
      Cloudflare dashboard -> Workers & Pages -> Create Worker -> paste this
-     whole file -> Deploy. Copy the workers.dev URL and paste it into the
-     reader app. Optional environment variables:
+     whole file -> Deploy (from any device/network that can open
+     dash.cloudflare.com). Then open scp-reader.html on your phone and
+     paste the worker URL (https://name.account.workers.dev) once.
+     Optional environment variables:
        DEFAULT_SITE  (default: scp-wiki.wikidot.com)
        EXTRA_HOSTS   (comma-separated extra hosts, subdomains included)
    ===================================================================== */
 
 export default { fetch: handle };
 
-const VERSION = '1.0.0';
+const VERSION = '2.1.0';
 const DEFAULT_SITE_DEFAULT = 'scp-wiki.wikidot.com';
+const CROM_GRAPHQL = 'https://api.crom.avn.sh/graphql';
 
 /* Hosts that may be proxied. Suffixes cover *.wikidot.com / *.wdfiles.com. */
 const EXACT_HOSTS = [
@@ -117,65 +132,6 @@ const STRIP_RESP_HEADERS = new Set([
 ]);
 
 /* ------------------------------------------------------------------ */
-/* Tiny bridge injected into every proxied HTML page. It reports       */
-/* navigation / scroll to the reader shell and accepts commands.       */
-/* (Built with concatenation so the string never contains a literal    */
-/* closing script tag - keeps embedding safe.)                         */
-/* ------------------------------------------------------------------ */
-const SCRIPT_OPEN = '<scr' + 'ipt>';
-const SCRIPT_CLOSE = '</scr' + 'ipt>';
-const BRIDGE = SCRIPT_OPEN + String.raw`
-(function () {
-  'use strict';
-  if (window.__SCPBRIDGE) return; window.__SCPBRIDGE = 1;
-  function post(m) { try { m.src = 'scpbridge'; parent.postMessage(m, '*'); } catch (e) {} }
-  function sendNav() { post({ ev: 'nav', url: location.pathname + location.search + location.hash, title: document.title || '' }); }
-  function scrollKey() { return 'scps:' + location.pathname + location.search; }
-  function applyZoom(z) { try { document.body && (document.body.style.zoom = z); } catch (e) {} }
-  window.addEventListener('pagehide', function () { post({ ev: 'loading', on: 1 }); });
-  window.addEventListener('hashchange', function () { sendNav(); });
-  document.addEventListener('DOMContentLoaded', function () {
-    var z = 1; try { z = parseFloat(localStorage.getItem('scpz')) || 1; } catch (e) {}
-    applyZoom(z);
-    var restore = false;
-    try { restore = sessionStorage.getItem('scpr') === '1'; sessionStorage.removeItem('scpr'); } catch (e) {}
-    sendNav();
-    if (restore) {
-      var y = 0; try { y = parseFloat(sessionStorage.getItem(scrollKey())) || 0; } catch (e) {}
-      if (y > 0) { window.scrollTo(0, y); setTimeout(function () { window.scrollTo(0, y); }, 400); }
-    }
-    try {
-      document.querySelectorAll('a[target="_blank"]').forEach(function (a) {
-        try { if (a.hostname === location.hostname) a.removeAttribute('target'); } catch (e) {}
-      });
-    } catch (e) {}
-  });
-  window.addEventListener('load', function () { sendNav(); });
-  var tick = false;
-  window.addEventListener('scroll', function () {
-    if (tick) return; tick = true;
-    requestAnimationFrame(function () {
-      tick = false;
-      var d = document.documentElement, b = document.body;
-      var st = window.pageYOffset || d.scrollTop || b.scrollTop || 0;
-      var sh = (d.scrollHeight || b.scrollHeight || 0) - window.innerHeight;
-      if (sh > 0) post({ ev: 'scroll', pct: Math.min(1, Math.max(0, st / sh)), y: st });
-      try { sessionStorage.setItem(scrollKey(), String(Math.round(st))); } catch (e) {}
-    });
-  }, { passive: true });
-  window.addEventListener('message', function (e) {
-    var d = e.data; if (!d || d.cmd === undefined) return;
-    if (d.cmd === 'go') {
-      try { sessionStorage.setItem('scpr', d.restore ? '1' : '0'); } catch (err) {}
-      try { location.href = d.url; } catch (err) {}
-    } else if (d.cmd === 'reload') { location.reload(); }
-    else if (d.cmd === 'zoom') { applyZoom(d.scale || 1); try { localStorage.setItem('scpz', String(d.scale || 1)); } catch (err) {} }
-    else if (d.cmd === 'top') { window.scrollTo(0, 0); }
-  });
-})();
-` + SCRIPT_CLOSE;
-
-/* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -203,19 +159,6 @@ function parseRaw(pathname) {
   let host = m[1];
   try { host = decodeURIComponent(host); } catch (e) {}
   return { host: host.toLowerCase(), path: m[2] || '/' };
-}
-
-/* If the Referer is one of our own proxied pages, return its target host. */
-function refererHost(request, url) {
-  const ref = request.headers.get('referer');
-  if (!ref) return null;
-  try {
-    const r = new URL(ref);
-    if (r.origin !== url.origin) return null;
-    const t = parseRaw(r.pathname);
-    if (!t) return null;
-    return t.host;
-  } catch (e) { return null; }
 }
 
 function upstreamHeaders(request, upstreamUrl) {
@@ -272,10 +215,6 @@ function fixCharset(ctype) {
   return ctype + (ctype.endsWith(';') ? ' ' : '; ') + 'charset=utf-8';
 }
 
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-}
-
 /* ------------------------------------------------------------------ */
 /* URL rewriting                                                       */
 /* ------------------------------------------------------------------ */
@@ -302,10 +241,6 @@ function textualPass(text) {
   return String(text).replace(HOST_TEXT_RE, (m, h) => '/raw/' + h.toLowerCase());
 }
 
-const ATTR_RE = /(\b(?:href|src|action|formaction|poster|data-src)\s*=\s*)("([^"]*)"|'([^']*)')/gi;
-const SRCSET_RE = /(\bsrcset\s*=\s*)("([^"]*)"|'([^']*)')/gi;
-const STYLE_ATTR_RE = /(\bstyle\s*=\s*)("([^"]*)"|'([^']*)')/gi;
-
 function isAdTag(tagText, body) {
   const m = String(tagText).match(/\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')/i) || [];
   const url = m[1] !== undefined ? m[1] : m[2];
@@ -328,109 +263,223 @@ function rewriteCss(css, pageUrl, env) {
   return css;
 }
 
-function rewriteOneAttr(tag, name, pageUrl, env) {
-  return String(tag).replace(new RegExp('(\\b' + name + '\\s*=\\s*)(("([^"]*)")|(\'([^\']*)\'))', 'i'), (m, pre, all, dq, v1, sq, v2) => {
-    const val = v1 !== undefined ? v1 : v2;
-    const w = attrTarget(val, pageUrl, env);
-    if (!w || w === val) return m;
-    return pre + (v1 !== undefined ? '"' + w + '"' : "'" + w + "'");
+/* JSON error helper - the worker is an API, so even errors are JSON. */
+function jsonErr(status, error, detail) {
+  const body = { ok: false, error: String(error || 'error') };
+  if (detail) body.detail = String(detail);
+  return new Response(JSON.stringify(body), {
+    status: status || 500,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*',
+      'x-scp-proxy': VERSION,
+    },
   });
 }
 
-function rewriteHtml(html, pageUrl, env) {
-  /* 1. drop <base>, SRI integrity attrs, CSP <meta>. */
+/* ------------------------------------------------------------------ */
+/* JSON API for the native reader app                                  */
+/*                                                                     */
+/*   GET /api/page/<wikidot path>   ->  { ok, status, host, path, html }     */
+/*        Fetches the wiki page upstream (following redirects), strips */
+/*        ads / scripts / trackers, returns the raw-ish HTML. The app  */
+/*        parses it client-side (DOMParser) and renders it natively -  */
+/*        wiki JS never runs on the phone.                             */
+/*   GET /api/search?q=<query>      ->  { ok, results:[{p,t,r}] }      */
+/*        Full-text search via the Crom GraphQL API.                   */
+/*   GET /api/random                ->  { ok, p, t }                   */
+/*        Random page via Crom (falls back to the 302 wiki route on    */
+/*        the app side if Crom is unreachable).                        */
+/* ------------------------------------------------------------------ */
+
+function json(obj, status, extra) {
+  const h = {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'cache-control': 'no-store',
+    'x-scp-proxy': VERSION,
+  };
+  if (extra) Object.assign(h, extra);
+  return new Response(JSON.stringify(obj), { status: status || 200, headers: h });
+}
+
+/* Strip everything the reader never needs: all scripts (wiki JS must not
+   run on the phone), link tags, iframes, base, CSP/refresh metas, SRI,
+   ad/tracker tags. Inline <style> blocks are KEPT (author CSS, the app
+   scopes them). Attribute URLs are left untouched - the app resolves
+   them against the real page URL and maps them to worker routes. */
+function apiSanitize(html) {
+  html = String(html);
   html = html.replace(/<base\b[^>]*\/?>/gi, '');
   html = html.replace(/\sintegrity\s*=\s*(?:"[^"]*"|'[^']*')/gi, '');
-  html = html.replace(/<meta\b(?=[^>]*http-equiv\s*=\s*["']?content-security-policy["']?)[^>]*>/gi, '');
-
-  /* 2. stash <script> blocks: drop ad scripts, rewrite src, keep body for later. */
-  const scripts = [];
-  html = html.replace(/(<script\b[^>]*>)([\s\S]*?)<\/script\s*>/gi, (m, open, body) => {
-    if (isAdTag(open, body)) return '';
-    const openFixed = rewriteOneAttr(open, 'src', pageUrl, env);
-    scripts.push({ open: openFixed, body });
-    return '\u0001' + (scripts.length - 1) + '\u0001';
-  });
-
-  /* 3. drop ad <link>, <img> (tracking pixels), <iframe> tags. */
+  html = html.replace(/<meta\b[^>]*>/gi, m =>
+    /http-equiv\s*=\s*["']?(content-security-policy|refresh)/i.test(m) ? '' : m);
+  /* drop ad/tracker link + img + iframe tags first (keeps the check meaningful) */
   html = html.replace(/<link\b[^>]*>/gi, m => (isAdTag(m) ? '' : m));
   html = html.replace(/<img\b[^>]*>/gi, m => (isAdTag(m) ? '' : m));
-  html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, m => (isAdTag(m) ? '' : m));
-
-  /* 4. rewrite URL attributes + srcset + inline style url(...). */
-  html = html.replace(ATTR_RE, (m, pre, quoted, v1, v2) => {
-    const val = v1 !== undefined ? v1 : v2;
-    const w = attrTarget(val, pageUrl, env);
-    if (!w || w === val) return m;
-    const quote = quoted[0];
-    return pre + quote + w + quote;
-  });
-  html = html.replace(SRCSET_RE, (m, pre, quoted, v1, v2) => {
-    const val = v1 !== undefined ? v1 : v2;
-    const fixed = val.split(',').map(item => {
-      const t = item.trim().split(/\s+/);
-      if (t[0]) { const w = attrTarget(t[0], pageUrl, env); if (w) t[0] = w; }
-      return t.join(' ');
-    }).join(', ');
-    const quote = quoted[0];
-    return pre + quote + fixed + quote;
-  });
-  html = html.replace(STYLE_ATTR_RE, (m, pre, quoted, v1, v2) => {
-    const val = v1 !== undefined ? v1 : v2;
-    const fixed = rewriteCss(val, pageUrl, env);
-    if (fixed === val) return m;
-    const quote = quoted[0];
-    return pre + quote + fixed + quote;
-  });
-
-  /* 5. rewrite <style> blocks (css files AND inline page css). */
-  html = html.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/gi, (m, open, body, close) =>
-    open + rewriteCss(body, pageUrl, env) + close);
-
-  /* 6. meta refresh targets. */
-  html = html.replace(/(<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*?content\s*=\s*["'][^"']*?url\s*=\s*)([^"']+)(["'])/gi, (m, pre, u, q) => {
-    const w = attrTarget(u.trim(), pageUrl, env);
-    return pre + (w || u) + q;
-  });
-
-  /* 7. restore scripts with the textual URL pass. */
-  html = html.replace(/\u0001(\d+)\u0001/g, (m, i) => {
-    const s = scripts[+i];
-    if (!s) return '';
-    return s.open + textualPass(s.body) + SCRIPT_CLOSE;
-  });
-
-  /* 8. inject the reader bridge. */
-  if (/<\/head>/i.test(html)) html = html.replace(/<\/head>/i, m => BRIDGE + m);
-  else if (/<\/body>/i.test(html)) html = html.replace(/<\/body>/i, m => BRIDGE + m);
-  else html += BRIDGE;
-
+  html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>|<iframe\b[^>]*\/?>/gi, m => (isAdTag(m) ? '' : m));
+  /* then remove ALL scripts and links and iframes outright */
+  html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+  html = html.replace(/<script\b[^>]*\/?>/gi, '');
+  html = html.replace(/<link\b[^>]*>/gi, '');
+  html = html.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, '');
+  html = html.replace(/<iframe\b[^>]*\/?>/gi, '');
   return html;
 }
 
-/* ------------------------------------------------------------------ */
-/* Error page (styled, bridge-equipped so the reader still works)      */
-/* ------------------------------------------------------------------ */
-function errorPage(status, title, detail, reqUrl) {
-  const html = '<!doctype html><html><head><meta charset="utf-8">'
-    + '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    + '<title>Worker error - ' + esc(title) + '</title>'
-    + '<style>body{background:#0b0d11;color:#e7ebf2;font:16px/1.6 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;'
-    + 'margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;text-align:center}'
-    + '.c{max-width:420px}.g{color:#d64545;font-size:40px;font-weight:800;letter-spacing:2px}'
-    + 'h1{font-size:18px;margin:12px 0 8px}p{color:#8b93a3;font-size:14px;word-break:break-all}'
-    + 'code{color:#c73030;font-size:12px}</style></head><body><div class="c">'
-    + '<div class="g">' + status + '</div><h1>' + esc(title) + '</h1>'
-    + '<p>' + esc(detail) + '</p><p><code>' + esc(reqUrl ? reqUrl.pathname : '') + '</code></p>'
-    + '</div>' + BRIDGE + '</body></html>';
-  return new Response(html, {
-    status,
-    headers: {
-      'content-type': 'text/html; charset=utf-8',
-      'cache-control': 'no-store',
-      'access-control-allow-origin': '*',
-    },
-  });
+async function fetchWithTimeout(upstreamUrl, init) {
+  return await Promise.race([
+    fetch(new Request(upstreamUrl, init)),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('upstream timeout after ' + UPSTREAM_TIMEOUT + 'ms')), UPSTREAM_TIMEOUT)),
+  ]);
+}
+
+async function apiPage(request, env, ctx, url) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return json({ ok: false, error: 'GET only' }, 405);
+  }
+  /* Optional ?host= lets the reader open sibling wikis (scp-int, cn...)
+     in-app. Still only the allowlisted family, still API-only. */
+  let site = (url.searchParams.get('host') || '').trim().toLowerCase().replace(/\/+$/, '');
+  if (site) {
+    if (!hostAllowed(site, env)) {
+      return json({ ok: false, error: 'host not allowed', detail: site }, 403);
+    }
+  } else {
+    site = defaultSite(env);
+  }
+  /* Path after /api/page (keeps its percent-encoding), plus query string. */
+  let raw = url.pathname.slice('/api/page'.length) || '/';
+  if (!raw.startsWith('/')) raw = '/' + raw;
+
+  /* Short edge-side cache: pages rarely change; 5 minutes is fresh enough
+     for a reader and makes repeats instant. */
+  const cacheKey = url.origin + '/api/page' + raw + url.search;
+  if (request.method === 'GET' && typeof caches !== 'undefined') {
+    try {
+      const hit = await caches.default.match(new Request(cacheKey, { method: 'GET' }));
+      if (hit) {
+        const h = new Headers(hit.headers);
+        h.set('x-scp-cache', 'hit');
+        return new Response(hit.body, { status: hit.status, headers: h });
+      }
+    } catch (e) {}
+  }
+
+  /* strip our own ?host= param so it never reaches the upstream site */
+  let upstreamSearch = url.search;
+  if (url.searchParams.has('host')) {
+    const qp = new URLSearchParams(url.search);
+    qp.delete('host');
+    upstreamSearch = qp.toString();
+    if (upstreamSearch) upstreamSearch = '?' + upstreamSearch;
+  }
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL('https://' + site + raw + upstreamSearch);
+  } catch (e) {
+    return json({ ok: false, error: 'bad path' }, 400);
+  }
+
+  let res;
+  try {
+    res = await fetchWithTimeout(upstreamUrl, {
+      method: 'GET',
+      headers: {
+        'accept': 'text/html,application/xhtml+xml',
+        'accept-language': 'en',
+        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+      },
+      redirect: 'follow',
+    });
+  } catch (e) {
+    return json({ ok: false, error: 'upstream unreachable', detail: String((e && e.message) || e) }, 502);
+  }
+
+  /* Follow redirect chains give us the final URL (e.g. /random:random-scp). */
+  let finalPath = raw;
+  try {
+    const fu = new URL(res.url || upstreamUrl.href);
+    finalPath = fu.pathname + fu.search || '/';
+  } catch (e) {}
+
+  const ctype = (res.headers.get('content-type') || '').toLowerCase();
+  if (!ctype.includes('text/html') && !ctype.includes('application/xhtml')) {
+    return json({ ok: false, error: 'not a wiki page', status: res.status, path: finalPath }, 415);
+  }
+
+  const html = apiSanitize(await res.text());
+  const out = json({
+    ok: true,
+    status: res.status,
+    host: site,
+    path: finalPath,
+    html: html,
+  }, 200, { 'cache-control': 'public, max-age=300' });
+
+  if (request.method === 'GET' && res.status === 200 && typeof caches !== 'undefined' && ctx) {
+    try {
+      ctx.waitUntil(caches.default.put(new Request(cacheKey, { method: 'GET' }), out.clone()));
+    } catch (e) {}
+  }
+  return out;
+}
+
+/* Crom GraphQL helpers (search + random). */
+async function cromQuery(query, variables) {
+  const res = await Promise.race([
+    fetch(CROM_GRAPHQL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify({ query, variables: variables || {} }),
+    }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('crom timeout')), 12000)),
+  ]);
+  if (!res.ok) throw new Error('crom http ' + res.status);
+  const j = await res.json();
+  if (j.errors && j.errors.length) throw new Error('crom error');
+  return j.data || {};
+}
+
+function cromPathOf(u) {
+  try { return new URL(String(u)).pathname || '/'; } catch (e) { return '/'; }
+}
+
+async function apiSearch(request, env, url) {
+  if (request.method !== 'GET') return json({ ok: false, error: 'GET only' }, 405);
+  const q = (url.searchParams.get('q') || '').trim();
+  if (!q) return json({ ok: false, error: 'missing q' }, 400);
+  const site = defaultSite(env);
+  try {
+    const data = await cromQuery(
+      'query($q:String!,$base:String){ searchPages(query:$q, filter:{anyBaseUrl:$base}) { url wikidotInfo { title rating } } }',
+      { q, base: 'http://' + site });
+    const pages = Array.isArray(data.searchPages) ? data.searchPages : [];
+    const results = pages.slice(0, 50).map(p => {
+      const wi = p.wikidotInfo || {};
+      const path = cromPathOf(p.url);
+      return { p: path, t: wi.title || decodeURIComponent(path.split('/').pop() || ''), r: (wi.rating == null ? null : wi.rating) };
+    });
+    return json({ ok: true, q: q, site: site, results: results });
+  } catch (e) {
+    return json({ ok: false, error: 'search unavailable', detail: String((e && e.message) || e) }, 502);
+  }
+}
+
+async function apiRandom(request, env) {
+  if (request.method !== 'GET') return json({ ok: false, error: 'GET only' }, 405);
+  const site = defaultSite(env);
+  try {
+    const data = await cromQuery(
+      'query($base:String){ randomPage(filter:{anyBaseUrl:$base}) { page { url wikidotInfo { title } } } }',
+      { base: 'http://' + site });
+    const page = data.randomPage && data.randomPage.page;
+    if (!page || !page.url) throw new Error('no random page');
+    return json({ ok: true, p: cromPathOf(page.url), t: (page.wikidotInfo && page.wikidotInfo.title) || '' });
+  } catch (e) {
+    return json({ ok: false, error: 'random unavailable', detail: String((e && e.message) || e) }, 502);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -451,52 +500,67 @@ async function handle(request, env, ctx) {
       });
     }
 
-    if (url.pathname === '/__worker/ping') {
-      return new Response(
-        JSON.stringify({ ok: true, proxy: 'scp-wiki-worker', version: VERSION, site: defaultSite(env) }),
-        {
-          status: 200,
-          headers: {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'no-store',
-            'access-control-allow-origin': '*',
-            'x-scp-proxy': VERSION,
-          },
-        }
-      );
+    /* / and /__worker/ping: JSON status. This worker serves no pages -
+       opening its URL shows this status object, and that is by design. */
+    if (url.pathname === '/' || url.pathname === '/__worker/ping') {
+      const body = JSON.stringify({
+        ok: true,
+        proxy: 'scp-wiki-worker',
+        version: VERSION,
+        mode: 'api',
+        site: defaultSite(env),
+        api: true,
+        endpoints: {
+          page: '/api/page/<wiki-path>[?host=<wiki-host>]',
+          search: '/api/search?q=<query>',
+          random: '/api/random',
+          asset: '/raw/<host>/<path>',
+          ping: '/__worker/ping',
+        },
+        note: 'API-only worker - no pages are served here. The reader app is the separate single-file scp-reader.html.',
+      });
+      return new Response(request.method === 'HEAD' ? null : body, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'access-control-allow-origin': '*',
+          'x-scp-proxy': VERSION,
+        },
+      });
     }
     if (url.pathname.startsWith('/__worker/')) {
-      return new Response('not found', { status: 404 });
+      return jsonErr(404, 'not found');
     }
 
     if (!['GET', 'HEAD', 'POST'].includes(request.method)) {
       return new Response('method not allowed', { status: 405, headers: { allow: 'GET, HEAD, POST' } });
     }
 
-    let target = parseRaw(url.pathname);
-    if (!target) {
-      const rh = refererHost(request, url);
-      if (rh && hostAllowed(rh, env)) {
-        /* Relative URL requested from an already-proxied page. */
-        target = { host: rh, path: url.pathname };
-      } else {
-        /* Unknown bare path: assume the default site, keep query. */
-        const dest = '/raw/' + defaultSite(env) + (url.pathname === '/' ? '/' : url.pathname) + url.search;
-        return new Response(null, {
-          status: 302,
-          headers: { location: dest, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
-        });
+    /* ---------------- JSON API (the reader app talks to these) -------------
+       The phone ONLY ever calls these worker endpoints; the worker does all
+       upstream fetching. No wiki URL is ever contacted from the phone.       */
+    if (url.pathname === '/api/page' || url.pathname.startsWith('/api/page/')) {
+      return await apiPage(request, env, ctx, url);
+    }
+    if (url.pathname === '/api/search') return await apiSearch(request, env, url);
+    if (url.pathname === '/api/random') return await apiRandom(request, env);
+
+    /* Explicit /raw/ asset routes only. Unknown bare paths are NOT
+       proxied (v2.1: no site mirroring, no referer guesswork). */
+    const target = parseRaw(url.pathname);
+    if (target) {
+      if (!hostAllowed(target.host, env)) {
+        return jsonErr(403, 'host not allowed',
+          'This worker only proxies the SCP Wiki / Wikidot family of sites. Requested host: ' + target.host);
       }
+      return await proxy(request, env, ctx, target, url);
     }
 
-    if (!hostAllowed(target.host, env)) {
-      return errorPage(403, 'Host not allowed',
-        'This worker only proxies the SCP Wiki / Wikidot family of sites. Requested host: ' + target.host, url);
-    }
-
-    return await proxy(request, env, ctx, target, url);
+    return jsonErr(404, 'unknown endpoint',
+      'This worker is API-only. Try /api/page/<wiki-path>, /api/search?q=, /api/random, /raw/<host>/<path> or /__worker/ping.');
   } catch (e) {
-    return errorPage(500, 'Worker error', String((e && e.message) || e), url);
+    return jsonErr(500, 'worker error', String((e && e.message) || e));
   }
 }
 
@@ -509,7 +573,7 @@ async function proxy(request, env, ctx, target, url) {
   try {
     upstreamUrl = new URL('https://' + target.host + target.path + url.search);
   } catch (e) {
-    return errorPage(400, 'Bad upstream URL', String(e.message || e), url);
+    return jsonErr(400, 'bad upstream URL', String(e.message || e));
   }
 
   let body;
@@ -545,8 +609,8 @@ async function proxy(request, env, ctx, target, url) {
       new Promise((_, rej) => setTimeout(() => rej(new Error('upstream timeout after ' + UPSTREAM_TIMEOUT + 'ms')), UPSTREAM_TIMEOUT)),
     ]);
   } catch (e) {
-    return errorPage(502, 'Upstream unreachable',
-      'The worker could not fetch https://' + upstreamUrl.host + ' - ' + String((e && e.message) || e), url);
+    return jsonErr(502, 'upstream unreachable',
+      'The worker could not fetch https://' + upstreamUrl.host + ' - ' + String((e && e.message) || e));
   }
 
   /* Follow redirects ourselves so Location can be rewritten. */
@@ -582,8 +646,15 @@ async function proxy(request, env, ctx, target, url) {
   }
 
   const isHtml = ctype.includes('text/html') || ctype.includes('application/xhtml');
+  /* v2.1: /raw/ is an ASSET proxy - HTML pages are never mirrored or
+     rendered by this worker. The reader renders pages itself from
+     /api/page. Opening a /raw/ page URL just returns this JSON notice. */
+  if (isHtml) {
+    return jsonErr(res.status >= 400 ? res.status : 415, 'html not proxied',
+      'This worker serves assets + JSON only. Pages come from /api/page/<path> and are rendered by the reader app.');
+  }
   const isCss = ctype.includes('text/css');
-  const isTextual = isHtml || isCss || /javascript|ecmascript|json/.test(ctype) || ctype.startsWith('text/');
+  const isTextual = isCss || /javascript|ecmascript|json/.test(ctype) || ctype.startsWith('text/');
 
   if (isTextual) {
     const cl = +(res.headers.get('content-length') || 0);
@@ -591,10 +662,7 @@ async function proxy(request, env, ctx, target, url) {
       return new Response(res.body, { status: res.status, headers });
     }
     const text = await res.text();
-    let out;
-    if (isHtml) out = rewriteHtml(text, upstreamUrl, env);
-    else if (isCss) out = rewriteCss(text, upstreamUrl, env);
-    else out = textualPass(text);
+    const out = isCss ? rewriteCss(text, upstreamUrl, env) : textualPass(text);
     headers.set('content-type', fixCharset(ctype || 'text/plain'));
     headers.delete('etag');
     headers.delete('last-modified');

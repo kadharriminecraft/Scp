@@ -56,7 +56,7 @@
 
 export default { fetch: handle };
 
-const VERSION = '3.2.0';
+const VERSION = '3.3.0';
 const DEFAULT_SITE_DEFAULT = 'scp-wiki.wikidot.com';
 const CROM_GRAPHQL = 'https://api.crom.avn.sh/graphql';
 
@@ -85,6 +85,9 @@ const AD_DOMAINS = [
   'media.net', 'demdex.net', 'agkn.com', 'moatads.com', 'adsafeprotected.com',
   'triplelift.com', 'yieldmo.com', 'gumgum.com', 'smartadserver.com',
   'd3j8vl19c1131u.cloudfront.net',
+  /* id-sync pixels seen in live fixture <img> tags */
+  'tapad.com', 'turn.com', 'sonobi.com', '360yield.com', 'rqtrk.eu',
+  'cpx.to', 'adsymptotic.com', 'lijit.com',
 ];
 function isAdDomain(host) {
   host = String(host || '').toLowerCase();
@@ -263,6 +266,206 @@ async function fetchWithTimeout(url, init, ms) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Small-asset inlining + asset memory cache                           */
+/* ------------------------------------------------------------------ */
+
+/* CSS chrome (header bands, logos, icons, small fonts) used to arrive
+   as tokens, fetched one-by-one through /api/asset only AFTER the page
+   painted - a slow straggler held the whole batch (the "header has no
+   color" + "images trickle in" effect). Now assets under the size cap
+   are fetched server-side while the CSS is inlined and embedded as
+   data: URIs directly in the stylesheet: they arrive with the render
+   package itself, zero extra round trips. Anything bigger, slower, or
+   over the per-render budget stays a token for the client to fetch. */
+const ASSET_MEM = new Map();      /* url -> {at, len, dataUri} small assets */
+const ASSET_MEM_TTL = 30 * 60 * 1000;
+const ASSET_MEM_MAX = 240;
+
+const BLOB_MEM = new Map();       /* url -> {at, status, ct, etag, buf} full assets */
+const BLOB_MEM_TTL = 10 * 60 * 1000;
+const BLOB_MEM_MAX_BYTES = 24 * 1024 * 1024;
+const BLOB_MEM_MAX_ITEMS = 72;
+const BLOB_MEM_BYTES = 3 * 1024 * 1024;   /* per-asset cache cap */
+const BUF_INFLIGHT = new Map();    /* url -> promise (dedupes warm-up vs client) */
+
+const INLINE_MAX = 40 * 1024;            /* per-asset inline cap */
+const INLINE_BUDGET = 700 * 1024;        /* per-render data-URI budget */
+const INLINE_TIMEOUT = 2500;
+const WARM_MAX = 15;                     /* images prefetched per render */
+
+function assetMemTrim() {
+  if (ASSET_MEM.size <= ASSET_MEM_MAX) return;
+  const keys = Array.from(ASSET_MEM.keys());
+  for (let i = 0; i < keys.length - ASSET_MEM_MAX; i++) ASSET_MEM.delete(keys[i]);
+}
+
+let blobMemTotal = 0;
+function blobMemTrim() {
+  while (BLOB_MEM.size > BLOB_MEM_MAX_ITEMS || blobMemTotal > BLOB_MEM_MAX_BYTES) {
+    const k = BLOB_MEM.keys().next().value;
+    if (k === undefined) break;
+    const e = BLOB_MEM.get(k);
+    BLOB_MEM.delete(k);
+    blobMemTotal -= e.buf.byteLength;
+  }
+}
+
+/* extension -> mime for data URIs (also fixes text/css mixups) */
+function mimeFor(ct, abs) {
+  let path = '';
+  try { path = new URL(abs).pathname.toLowerCase(); } catch (e) {}
+  const ext = (path.match(/\.([a-z0-9]+)$/) || [])[1] || '';
+  const byExt = {
+    png: 'image/png', gif: 'image/gif', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+    webp: 'image/webp', svg: 'image/svg+xml', ico: 'image/x-icon', bmp: 'image/bmp',
+    woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
+    eot: 'application/vnd.ms-fontobject',
+  };
+  ct = String(ct || '').toLowerCase().split(';')[0].trim();
+  if (/^(image\/|font\/)/.test(ct)) return ct;
+  if (ct === 'text/plain' || ct === 'application/octet-stream' || ct === 'binary/octet-stream' || !ct) {
+    return byExt[ext] || null;
+  }
+  return null; /* html, css, feeds... never inline */
+}
+
+function looksInlineable(abs) {
+  let path = '';
+  try { path = new URL(abs).pathname.toLowerCase(); } catch (e) { return false; }
+  return /\.(png|gif|jpe?g|webp|svg|ico|bmp|woff2?|ttf|otf|eot)$/.test(path);
+}
+
+function bufToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(s);
+}
+
+/* Try to embed one asset as a data: URI. Returns '' when the asset
+   should stay a client-side token (big, slow, or budget spent). The
+   upstream fetch + cache is global (deduped); the byte budget is
+   per-render (R). */
+const INLINE_INFLIGHT = new Map();  /* url -> promise<dataUri|''> */
+function inlineDataUri(abs, env, R) {
+  if (R.budget <= 0 || !looksInlineable(abs)) return Promise.resolve('');
+  const hit = ASSET_MEM.get(abs);
+  if (hit && Date.now() - hit.at < ASSET_MEM_TTL) {
+    if (hit.len <= R.budget) { R.budget -= hit.len; return Promise.resolve(hit.dataUri); }
+    return Promise.resolve('');
+  }
+  let p = INLINE_INFLIGHT.get(abs);
+  if (!p) {
+    p = (async () => {
+      try {
+        const res = await fetchWithTimeout(abs, {
+          method: 'GET',
+          headers: { 'accept': 'image/*,font/*,*/*;q=0.8', 'user-agent': UA_MOBILE, 'referer': originOf(abs) },
+          redirect: 'follow',
+        }, INLINE_TIMEOUT);
+        if (!res.ok) return '';
+        const cl = +(res.headers.get('content-length') || 0);
+        if (cl && cl > INLINE_MAX) return '';
+        const buf = await res.arrayBuffer();
+        if (!buf.byteLength || buf.byteLength > INLINE_MAX) return '';
+        const mime = mimeFor(res.headers.get('content-type'), abs);
+        if (!mime) return '';
+        const b64 = bufToB64(buf);
+        const dataUri = 'data:' + mime + ';base64,' + b64;
+        ASSET_MEM.set(abs, { at: Date.now(), len: b64.length, dataUri });
+        assetMemTrim();
+        return dataUri;
+      } catch (e) {
+        return ''; /* slow or unreachable: keep the token path */
+      }
+    })();
+    INLINE_INFLIGHT.set(abs, p);
+    p.then(() => INLINE_INFLIGHT.delete(abs), () => INLINE_INFLIGHT.delete(abs));
+  }
+  return p.then(dataUri => {
+    if (!dataUri) return '';
+    if (dataUri.length > R.budget) return '';
+    R.budget -= dataUri.length;
+    return dataUri;
+  });
+}
+
+function originOf(u) {
+  try { return new URL(u).origin + '/'; } catch (e) { return u; }
+}
+
+/* Buffered asset fetch shared by warm-up and /api/asset so a client
+   request landing during a warm-up rides the SAME upstream fetch. */
+function fetchAssetBuffered(upstream, init) {
+  let p = BUF_INFLIGHT.get(upstream);
+  if (!p) {
+    p = fetchWithTimeout(upstream, init, UPSTREAM_TIMEOUT).then(async res => {
+      return {
+        status: res.status,
+        ct: (res.headers.get('content-type') || '').toLowerCase(),
+        etag: res.headers.get('etag') || '',
+        lastMod: res.headers.get('last-modified') || '',
+        cl: +(res.headers.get('content-length') || 0),
+        buf: await res.arrayBuffer(),
+      };
+    });
+    BUF_INFLIGHT.set(upstream, p);
+    p.then(() => BUF_INFLIGHT.delete(upstream), () => BUF_INFLIGHT.delete(upstream));
+  }
+  return p;
+}
+
+/* Warm the image cache right after a render package is built: the
+   client asks for these a few hundred ms later and hits memory instead
+   of the (slow) wdfiles origin. Keeps well under the 50-subrequest
+   budget per invocation. */
+const WARM_FONT_MAX = 6;
+function warmAssets(assets) {
+  const urls = [];
+  const fonts = [];
+  for (const k in assets) {
+    const u = assets[k];
+    if (BLOB_MEM.has(u)) continue;
+    const clean = String(u).split('#')[0];
+    if (/\.(png|gif|jpe?g|webp|svg|ico|bmp)$/i.test(clean)) {
+      if (urls.length >= WARM_MAX) continue;
+      urls.push(u);
+    } else if (/\.(woff2?|ttf|otf|eot)([?#]|$)/i.test(clean) && fonts.length < WARM_FONT_MAX) {
+      /* theme webfonts (sigma pulls the whole rsms Inter superfamily):
+         the bridge fetches every font token right after paint - have
+         them already in isolate memory so they land in one burst */
+      fonts.push(u);
+    }
+  }
+  urls.push(...fonts);
+  let i = 0;
+  return (async function next() {
+    if (i >= urls.length) return;
+    const batch = urls.slice(i, i + 4);
+    i += 4;
+    await Promise.all(batch.map(async u => {
+      try {
+        const e = await fetchAssetBuffered(u, {
+          method: 'GET',
+          headers: { 'accept': 'image/*,*/*;q=0.8', 'user-agent': UA_MOBILE, 'referer': originOf(u) },
+          redirect: 'follow',
+        });
+        if (e.status === 200 && e.buf.byteLength && e.buf.byteLength <= BLOB_MEM_BYTES &&
+            !/html/.test(e.ct)) {
+          BLOB_MEM.set(u, { at: Date.now(), status: e.status, ct: e.ct, etag: e.etag, lastMod: e.lastMod, buf: e.buf });
+          blobMemTotal += e.buf.byteLength;
+          blobMemTrim();
+        }
+      } catch (err) { /* warm-up is best-effort */ }
+    }));
+    return next();
+  })();
+}
+
+/* ------------------------------------------------------------------ */
 /* CSS fetching + inlining                                             */
 /* ------------------------------------------------------------------ */
 
@@ -321,20 +524,32 @@ async function inlineCss(css, base, env, R, depth) {
       css = css.split('\x00I' + i + '\x00').join(texts[i] == null ? '' : texts[i]);
     }
   }
-  /* 2. tokenize url() references (tokens from recursive imports are
-         already resolved - leave them alone). Tokens ship as data: URLs so
-         the browser never tries to fetch them before the bridge swaps in
+  /* 2. url() references: two phases. Phase A swaps each url() for a
+         sentinel while collecting the absolute URL; phase B resolves
+         every URL in parallel - small images/fonts become data: URIs
+         embedded right in the stylesheet (they arrive with the render
+         package), the rest become token placeholders the client lazily
+         fetches through /api/asset. Tokens ship as data: URLs so the
+         browser never tries to fetch them before the bridge swaps in
          the real (worker-fetched) blob URLs. */
+  const urlRefs = [];
   css = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)/gi, (m, dq, sq, uq) => {
     const raw = dq !== undefined ? dq : (sq !== undefined ? sq : uq);
     if (raw == null || !raw) return m;
     const t = String(raw).trim();
-    if (/^(data:|about:)/i.test(t)) return m;
-    if (/^SCPW_A\d+$/.test(t)) return m;           /* already a token */
+    if (/^(data:|about:)/i.test(t)) return m;   /* data:,SCPW_A# tokens from nested imports are already resolved */
     const abs = absUrl(t, base);
     if (!abs || !assetUrlOk(new URL(abs), env)) return 'url("about:blank")';
-    return 'url("data:,' + R.token(abs) + '")';
+    return '\x00U' + (urlRefs.push(abs) - 1) + '\x00';
   });
+  if (urlRefs.length) {
+    const reps = await Promise.all(urlRefs.map(abs =>
+      inlineDataUri(abs, env, R).then(dataUri =>
+        dataUri ? 'url("' + dataUri + '")' : 'url("data:,' + R.token(abs) + '")')));
+    for (let i = 0; i < urlRefs.length; i++) {
+      css = css.split('\x00U' + i + '\x00').join(reps[i]);
+    }
+  }
   return css;
 }
 
@@ -342,7 +557,7 @@ async function inlineCss(css, base, env, R, depth) {
 /* HTML render engine                                                  */
 /* ------------------------------------------------------------------ */
 
-const BRIDGE_SRC = "/* SCPW BRIDGE - injected into every rendered page by the worker.\n   Runs inside a sandboxed iframe (unique origin, scripts allowed).\n   Responsibilities:\n     - lazy-load images + CSS assets through the worker (/api/asset)\n     - report navigation clicks / form submits to the parent browser\n     - reimplement the wiki interactions that need JS (collapsibles,\n       tabviews, the sigma-9 side-bar menu, top-bar dropdowns) because\n       the page's own scripts are stripped\n     - report scroll position + accept parent commands (scrollTo,\n       zoom, focus mode)\n   The worker appends an init call:  SCPW_INIT({w, a, u})   */\n\n(function () {\n  'use strict';\n\n  var CFG = null;          /* {w: worker origin, a: {token: url}, u: page url} */\n  var CACHE = {};          /* token -> blob url ('' = failed) */\n  var parentWin = window.parent;\n\n  function send(msg) {\n    try { parentWin.postMessage(msg, '*'); } catch (e) {}\n  }\n\n  /* ---------------- asset pipeline (through the worker) ---------------- */\n\n  function fetchAsset(url) {\n    return fetch(CFG.w + '/api/asset?url=' + encodeURIComponent(url), {\n      credentials: 'omit',\n    }).then(function (r) {\n      if (!r.ok) throw new Error('asset http ' + r.status);\n      return r.blob();\n    }).then(function (b) {\n      return URL.createObjectURL(b);\n    });\n  }\n\n  function resolveToken(tok) {\n    var c = CACHE[tok];\n    if (c !== undefined) return (c && typeof c.then === 'function') ? c : Promise.resolve(c);\n    var url = CFG.a[tok];\n    if (!url) return Promise.resolve('');\n    var p = fetchAsset(url).then(function (u) {\n      CACHE[tok] = u;\n      return u;\n    }, function () {\n      CACHE[tok] = '';\n      return '';\n    });\n    CACHE[tok] = p;\n    return p;\n  }\n\n  var TOKRE = /url\\(\"data:,(SCPW_A\\d+)\"\\)/g;\n\n  /* Images: placeholder src is a 1px gif; data-scpw holds the token.\n     The blob is decoded BEFORE the swap so the intrinsic size is known:\n     width/height attributes (lowest CSS priority, so site styles still\n     win) are written in the SAME frame as src. The placeholder then\n     already occupies the final box and no layout shift happens when\n     the pixels land - this is what made the text jitter while pages\n     settled. */\n  function swapImage(el) {\n    var tok = el.getAttribute('data-scpw');\n    if (!tok) return;\n    resolveToken(tok).then(function (u) {\n      el.removeAttribute('data-scpw');\n      if (!u) { el.classList.add('scpw-broken'); return; }\n      var probe = new Image();\n      probe.onload = function () {\n        if (probe.naturalWidth && probe.naturalHeight &&\n            !el.hasAttribute('width') && !el.hasAttribute('height')) {\n          el.setAttribute('width', probe.naturalWidth);\n          el.setAttribute('height', probe.naturalHeight);\n        }\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.onerror = function () {\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.src = u;   /* blob is already fetched: decode is near-instant */\n    });\n  }\n\n  function activateImages() {\n    var imgs = document.querySelectorAll('img[data-scpw]');\n    var list = Array.prototype.slice.call(imgs);\n    if (!('IntersectionObserver' in window)) {\n      list.forEach(function (el) { swapImage(el); });\n      return;\n    }\n    /* generous margin: images arrive well before they scroll into\n       view, so late loads never visibly move the text; entries that\n       already intersect fire immediately at observe time */\n    var io = new IntersectionObserver(function (entries) {\n      entries.forEach(function (e) {\n        if (e.isIntersecting) { io.unobserve(e.target); swapImage(e.target); }\n      });\n    }, { rootMargin: '1500px 0px' });\n    list.forEach(function (el) { io.observe(el); });\n  }\n\n  /* CSS: url() references arrive as non-fetching data: placeholders that\n     carry the token:  url(\"data:,SCPW_A7\"). All tokens are resolved FIRST,\n     then every <style> element and [style] attribute is rewritten in ONE\n     pass: one style recalculation (and one batch of font swaps) instead\n     of a reflow per url() reference. */\n\n  function patchStyles() {\n    var styles = Array.prototype.slice.call(document.querySelectorAll('style'));\n    var styled = Array.prototype.slice.call(document.querySelectorAll('[style]'));\n    var needed = {};\n    function collect(txt) {\n      var found = String(txt).match(TOKRE);\n      if (found) found.forEach(function (f) { needed[f] = 1; });\n    }\n    styles.forEach(function (s) { collect(s.textContent); });\n    styled.forEach(function (el) { collect(el.getAttribute('style') || ''); });\n    var pats = Object.keys(needed);\n    if (!pats.length) return;\n    Promise.all(pats.map(function (pat) {\n      return resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) {\n        return { pat: pat, url: u || 'about:blank' };\n      });\n    })).then(function (reps) {\n      function rewrite(txt) {\n        var out = txt;\n        reps.forEach(function (r) {\n          if (out.indexOf(r.pat) === -1) return;\n          out = out.split(r.pat).join('url(\"' + r.url + '\")');\n        });\n        return out;\n      }\n      styles.forEach(function (s) {\n        var txt = String(s.textContent);\n        var out = rewrite(txt);\n        if (out !== txt) { try { s.textContent = out; } catch (e) {} }\n      });\n      styled.forEach(function (el) {\n        var at = el.getAttribute('style');\n        if (!at) return;\n        var out = rewrite(at);\n        if (out !== at) { try { el.setAttribute('style', out); } catch (e) {} }\n      });\n    });\n  }\n\n  /* ---------------- interactions the wiki JS used to provide ----------- */\n\n  /* Sigma-9 side bar (the fixed ≡ button, top-left). The real site opens\n     it with a #side-bar fragment + CSS :target rules; inside a sandboxed\n     srcdoc frame fragment navigation never happens, so the bridge drives\n     the same open/close state with a class + equivalent CSS. */\n\n  function sbIsOpen() {\n    return document.documentElement.classList.contains('scpw-sb');\n  }\n\n  function sbOpen() {\n    if (sbIsOpen()) return;\n    document.documentElement.classList.add('scpw-sb');\n  }\n\n  function sbClose() {\n    document.documentElement.classList.remove('scpw-sb');\n  }\n\n  function scrollToAnchor(id) {\n    id = String(id).replace(/^#/, '');\n    if (!id) return;\n    var el = document.getElementById(id);\n    if (!el) {\n      var named = document.getElementsByName(id);\n      if (named && named.length) el = named[0];\n    }\n    if (el && el.scrollIntoView) el.scrollIntoView(true);\n  }\n\n  /* dropdown parents in the top bar: their \"javascript:;\" hrefs are\n     stripped by the worker, so the bridge toggles the submenu itself */\n  function toggleMenu(li) {\n    var parent = li.parentNode;\n    var willOpen = !li.classList.contains('scpw-open');\n    if (parent && parent.querySelectorAll) {\n      parent.querySelectorAll('li.scpw-open').forEach(function (o) {\n        if (o !== li) o.classList.remove('scpw-open');\n      });\n    }\n    li.classList.toggle('scpw-open', willOpen);\n  }\n\n  function tabviewInit() {\n    document.querySelectorAll('.yui-navset').forEach(function (set) {\n      var lis = set.querySelectorAll('.yui-nav li');\n      var panes = set.querySelectorAll('.yui-content > div');\n      var anyOn = false;\n      for (var i = 0; i < panes.length; i++) { if (panes[i].classList.contains('scpw-on')) anyOn = true; }\n      if (!anyOn) { selectTab(set, 0); }\n    });\n  }\n\n  function selectTab(set, idx) {\n    var lis = set.querySelectorAll('.yui-nav li');\n    var panes = set.querySelectorAll('.yui-content > div');\n    for (var i = 0; i < lis.length; i++) {\n      lis[i].classList.toggle('selected', i === idx);\n      lis[i].classList.toggle('scpw-on', i === idx);\n    }\n    for (var j = 0; j < panes.length; j++) {\n      panes[j].classList.toggle('scpw-on', j === idx);\n      panes[j].classList.toggle('selected', j === idx);\n    }\n  }\n\n  function init() {\n    /* focus-mode styles + tabview styles + broken-image styles */\n    var css = document.createElement('style');\n    css.textContent =\n      'html.scpw-focus #navi-bar,html.scpw-focus #navi-bar-shadow,' +\n      'html.scpw-focus #header,html.scpw-focus #top-bar,' +\n      'html.scpw-focus #side-bar,html.scpw-focus #search-top-box,' +\n      'html.scpw-focus #login-status,html.scpw-focus #footer,' +\n      'html.scpw-focus #page-info,html.scpw-focus .page-tags,' +\n      'html.scpw-focus #footer-bar-below,html.scpw-focus #footer-below' +\n      '{display:none!important}' +\n      'html.scpw-focus #container-wrap{margin-top:0!important}' +\n      'html.scpw-focus #content-wrap{margin:0!important}' +\n      'html.scpw-focus #main-content{margin:0!important}' +\n      '.yui-navset .yui-content>div{display:none}' +\n      '.yui-navset .yui-content>div.scpw-on{display:block}' +\n      '.scpw-broken{opacity:.15!important}' +\n      'a.scpw-file::after{content:\" \\\\2193\";font-size:.8em;opacity:.6}' +\n      /* side-bar open state (class twin of sigma-9's #side-bar:target) */\n      'html.scpw-sb #side-bar{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:15rem!important;max-width:82vw;' +\n      'height:100%!important;overflow-y:auto!important;z-index:9990!important;margin:0!important}' +\n      'html.scpw-sb #side-bar .close-menu{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:100%!important;height:100%!important;' +\n      'background:rgba(0,0,0,.35);z-index:-1;margin:0!important;padding:0!important;border:0}' +\n      /* top-bar dropdowns on touch */\n      '#top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}' +\n      '.mobile-top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}';\n    (document.head || document.documentElement).appendChild(css);\n\n    tabviewInit();\n    activateImages();\n    patchStyles();\n    sendReady();\n  }\n\n  function sendReady() {\n    var d = document.documentElement;\n    send({\n      scpw: 'ready',\n      title: document.title || '',\n      url: CFG.u,\n      scrollH: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n      y: window.scrollY || 0,\n    });\n  }\n\n  /* ---------------- click routing (capture phase) ---------------- */\n\n  document.addEventListener('click', function (e) {\n    if (e.defaultPrevented) return;\n    var t = e.target;\n    var closest = (t && t.closest) ? t.closest.bind(t) : null;\n    if (!closest) return;\n\n    /* tabview tabs */\n    var tabLink = closest('.yui-nav a');\n    if (tabLink) {\n      var set = tabLink.closest('.yui-navset');\n      if (set) {\n        e.preventDefault(); e.stopPropagation();\n        var lis = set.querySelectorAll('.yui-nav li');\n        var li = tabLink.closest('li');\n        var idx = Array.prototype.indexOf.call(lis, li);\n        selectTab(set, idx < 0 ? 0 : idx);\n        return;\n      }\n    }\n\n    /* collapsible blocks */\n    var clps = closest('.collapsible-block-link');\n    if (clps) {\n      var block = clps.closest('.collapsible-block');\n      if (block) {\n        e.preventDefault(); e.stopPropagation();\n        var folded = block.querySelector('.collapsible-block-folded');\n        var unfolded = block.querySelector('.collapsible-block-unfolded');\n        if (folded && unfolded) {\n          var showFolded = unfolded.style.display === 'none' || !unfolded.style.display;\n          folded.style.display = showFolded ? '' : 'none';\n          unfolded.style.display = showFolded ? 'none' : '';\n        }\n        return;\n      }\n    }\n\n    /* file downloads (worker-marked) */\n    var fileLink = closest('a[data-scpw-file]');\n    if (fileLink) {\n      e.preventDefault(); e.stopPropagation();\n      send({ scpw: 'file', href: fileLink.getAttribute('data-scpw-file') });\n      return;\n    }\n\n    /* form submit buttons: the frame sandbox blocks real form submission\n       (no allow-forms), so the bridge resolves the form itself. Must run\n       before the no-href/link branches below. */\n    var subBtn = null;\n    if ((t.tagName === 'INPUT' || t.tagName === 'BUTTON') && t.closest && t.closest('form')) {\n      var sTy = String(t.getAttribute('type') || (t.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();\n      if (sTy === 'submit' || sTy === 'image') subBtn = t;\n    }\n    if (subBtn) {\n      e.preventDefault(); e.stopPropagation();\n      handleForm(subBtn.closest('form'), subBtn);\n      return;\n    }\n\n    /* dropdown parents (wikidot \"javascript:;\" links - href stripped) */\n    var anyA = closest('a');\n    if (anyA && !anyA.getAttribute('href')) {\n      var li = anyA.closest('li');\n      if (li && li.querySelector('ul')) {\n        e.preventDefault(); e.stopPropagation();\n        toggleMenu(li);\n        return;\n      }\n    }\n\n    /* normal links */\n    var a = closest('a[href]');\n    if (!a) return;\n    var href = a.getAttribute('href') || '';\n    if (!href) return;\n    if (href.charAt(0) === '#') {\n      /* fragment links never navigate inside the sandbox: the sigma side\n         bar menu, its close scrim and in-page anchors are handled here */\n      e.preventDefault(); e.stopPropagation();\n      var frag = href.slice(1);\n      if (closest('.close-menu')) { sbClose(); return; }\n      if (frag === 'side-bar') { if (sbIsOpen()) sbClose(); else sbOpen(); return; }\n      if (!frag) { sbClose(); return; }\n      scrollToAnchor(frag);\n      return;\n    }\n    if (/^(javascript|mailto|tel|sms|about|data|blob):/i.test(href)) {\n      e.preventDefault();\n      if (/^mailto:|^tel:/i.test(href)) send({ scpw: 'ext', href: href, kind: 'contact' });\n      return;\n    }\n    e.preventDefault();\n    send({ scpw: 'nav', href: href });\n  }, true);\n\n  /* ---------------- forms (GET becomes navigation) ----------------\n\n     The sandboxed frame has no allow-forms, so real submit events never\n     fire: submit-button clicks and Enter-in-textfield are captured instead\n     and resolved here. The submit listener stays as a backstop. */\n\n  function handleForm(f, submitter) {\n    if (!f || !f.tagName || f.tagName.toUpperCase() !== 'FORM') return;\n    var method = (f.getAttribute('method') || 'get').toLowerCase();\n    var action = f.getAttribute('action') || CFG.u;\n    /* wikidot's search box carries a placeholder action (\"dummy\") that its\n       own scripts would rewrite at runtime; route it to the app's search */\n    if (/\\/dummy\\/?$/.test(action) || f.id === 'search-top-box-form') {\n      var sq = '';\n      try {\n        new FormData(f).forEach(function (v, k) {\n          if (k === 'query' && typeof v === 'string' && String(v).trim()) sq = String(v).trim();\n        });\n      } catch (err) {}\n      if (sq) send({ scpw: 'search', q: sq });\n      return;\n    }\n    if (method !== 'get') {\n      send({ scpw: 'blocked', reason: 'post', href: action });\n      return;\n    }\n    try {\n      var qs = new URLSearchParams();\n      new FormData(f).forEach(function (v, k) {\n        if (typeof v === 'string') qs.append(k, v);\n      });\n      if (submitter && submitter.name) qs.append(submitter.name, submitter.value || '');\n      var q = qs.toString();\n      send({ scpw: 'nav', href: action + (q ? (action.indexOf('?') > -1 ? '&' : '?') + q : '') });\n    } catch (err) {\n      send({ scpw: 'blocked', reason: 'form', href: action });\n    }\n  }\n\n  /* Enter in a text field = implicit form submission */\n  document.addEventListener('keydown', function (e) {\n    if (e.key !== 'Enter' || e.defaultPrevented) return;\n    var t = e.target;\n    if (!t || !t.closest || t.tagName !== 'INPUT') return;\n    var ty = String(t.getAttribute('type') || 'text').toLowerCase();\n    if (!/^(text|search|email|url|number|tel|password)$/.test(ty)) return;\n    var form = t.closest('form');\n    if (!form) return;\n    e.preventDefault(); e.stopPropagation();\n    handleForm(form, null);\n  }, true);\n\n  document.addEventListener('submit', function (e) {\n    e.preventDefault(); e.stopPropagation();\n    handleForm(e.target, null);\n  }, true);\n\n  /* ---------------- scroll reporting ---------------- */\n\n  var lastSent = 0;\n  function reportScroll(force) {\n    var now = Date.now();\n    if (!force && now - lastSent < 250) return;\n    lastSent = now;\n    var d = document.documentElement;\n    send({\n      scpw: 'scroll',\n      y: Math.round(window.scrollY || document.body.scrollTop || 0),\n      h: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n    });\n  }\n  window.addEventListener('scroll', function () { reportScroll(false); }, { passive: true });\n\n  /* ---------------- parent commands ---------------- */\n\n  window.addEventListener('message', function (e) {\n    var d = e.data;\n    if (!d || d.scpw !== 'cmd') return;\n    if (d.op === 'scrollTo') {\n      window.scrollTo(0, d.y || 0);\n    } else if (d.op === 'anchor') {\n      var id = String(d.a || '').replace(/^#/, '');\n      if (id) {\n        var el = document.getElementById(id);\n        if (!el) {\n          var named = document.getElementsByName(id);\n          if (named && named.length) el = named[0];\n        }\n        if (el && el.scrollIntoView) el.scrollIntoView(true);\n        else window.scrollTo(0, 0);\n      }\n    } else if (d.op === 'zoom') {\n      document.body.style.zoom = d.z || 1;\n      var vp = document.querySelector('meta[name=viewport]');\n      if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1');\n    } else if (d.op === 'focus') {\n      document.documentElement.classList.toggle('scpw-focus', !!d.on);\n    } else if (d.op === 'ping') {\n      sendReady();\n    } else if (d.op === 'top') {\n      window.scrollTo(0, 0);\n    }\n  });\n\n  /* ---------------- boot ---------------- */\n\n  window.SCPW_INIT = function (cfg) {\n    CFG = cfg || {};\n    if (document.readyState === 'loading') {\n      document.addEventListener('DOMContentLoaded', function () { init(); });\n    } else {\n      init();\n    }\n  };\n})();\n";
+const BRIDGE_SRC = "/* SCPW BRIDGE - injected into every rendered page by the worker.\n   Runs inside a sandboxed iframe (unique origin, scripts allowed).\n   Responsibilities:\n     - lazy-load images + CSS assets through the worker (/api/asset)\n     - report navigation clicks / form submits to the parent browser\n     - reimplement the wiki interactions that need JS (collapsibles,\n       tabviews, the sigma-9 side-bar menu, top-bar dropdowns) because\n       the page's own scripts are stripped\n     - report scroll position + accept parent commands (scrollTo,\n       zoom, focus mode)\n   The worker appends an init call:  SCPW_INIT({w, a, u})   */\n\n(function () {\n  'use strict';\n\n  var CFG = null;          /* {w: worker origin, a: {token: url}, u: page url} */\n  var CACHE = {};          /* token -> blob url ('' = failed) */\n  var parentWin = window.parent;\n\n  function send(msg) {\n    try { parentWin.postMessage(msg, '*'); } catch (e) {}\n  }\n\n  /* ---------------- asset pipeline (through the worker) ---------------- */\n\n  function fetchAsset(url) {\n    return fetch(CFG.w + '/api/asset?url=' + encodeURIComponent(url), {\n      credentials: 'omit',\n    }).then(function (r) {\n      if (!r.ok) throw new Error('asset http ' + r.status);\n      return r.blob();\n    }).then(function (b) {\n      return URL.createObjectURL(b);\n    });\n  }\n\n  function resolveToken(tok) {\n    var c = CACHE[tok];\n    if (c !== undefined) return (c && typeof c.then === 'function') ? c : Promise.resolve(c);\n    var url = CFG.a[tok];\n    if (!url) return Promise.resolve('');\n    var p = fetchAsset(url).then(function (u) {\n      CACHE[tok] = u;\n      return u;\n    }, function () {\n      CACHE[tok] = '';\n      return '';\n    });\n    CACHE[tok] = p;\n    return p;\n  }\n\n  var TOKRE = /url\\(\"data:,(SCPW_A\\d+)\"\\)/g;\n\n  /* Images: placeholder src is a 1px gif; data-scpw holds the token.\n     The blob is decoded BEFORE the swap so the intrinsic size is known:\n     width/height attributes (lowest CSS priority, so site styles still\n     win) are written in the SAME frame as src. The placeholder then\n     already occupies the final box and no layout shift happens when\n     the pixels land - this is what made the text jitter while pages\n     settled. */\n  function swapImage(el) {\n    var tok = el.getAttribute('data-scpw');\n    if (!tok) return;\n    resolveToken(tok).then(function (u) {\n      el.removeAttribute('data-scpw');\n      if (!u) { el.classList.add('scpw-broken'); return; }\n      var probe = new Image();\n      probe.onload = function () {\n        if (probe.naturalWidth && probe.naturalHeight &&\n            !el.hasAttribute('width') && !el.hasAttribute('height')) {\n          el.setAttribute('width', probe.naturalWidth);\n          el.setAttribute('height', probe.naturalHeight);\n        }\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.onerror = function () {\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.src = u;   /* blob is already fetched: decode is near-instant */\n    });\n  }\n\n  function activateImages() {\n    var imgs = document.querySelectorAll('img[data-scpw]');\n    var list = Array.prototype.slice.call(imgs);\n    if (!('IntersectionObserver' in window)) {\n      list.forEach(function (el) { swapImage(el); });\n      return;\n    }\n    /* generous margin: images arrive well before they scroll into\n       view, so late loads never visibly move the text; entries that\n       already intersect fire immediately at observe time */\n    var io = new IntersectionObserver(function (entries) {\n      entries.forEach(function (e) {\n        if (e.isIntersecting) { io.unobserve(e.target); swapImage(e.target); }\n      });\n    }, { rootMargin: '1500px 0px' });\n    list.forEach(function (el) { io.observe(el); });\n  }\n\n  /* CSS: url() references arrive as non-fetching data: placeholders that\n     carry the token:  url(\"data:,SCPW_A7\"). Most small chrome images and\n     fonts are already inlined as data: URIs by the worker; the tokens\n     that remain are resolved here. Background images are applied as\n     each lands (they never move text), fonts are applied in ONE pass\n     so text metrics swap once - and a safety timer guarantees a slow\n     straggler can never hold the page's backgrounds hostage. */\n\n  function patchStyles() {\n    var styles = Array.prototype.slice.call(document.querySelectorAll('style'));\n    var styled = Array.prototype.slice.call(document.querySelectorAll('[style]'));\n    var needed = {};\n    function collect(txt) {\n      var found = String(txt).match(TOKRE);\n      if (found) found.forEach(function (f) { needed[f] = 1; });\n    }\n    styles.forEach(function (s) { collect(s.textContent); });\n    styled.forEach(function (el) { collect(el.getAttribute('style') || ''); });\n    var pats = Object.keys(needed);\n    if (!pats.length) return;\n\n    var reps = {};        /* pat -> resolved blob url */\n    var fontPats = [], imgPats = [];\n    pats.forEach(function (pat) {\n      var tok = pat.match(/SCPW_A\\d+/)[0];\n      var url = CFG.a[tok] || '';\n      if (/\\.(woff2?|ttf|otf|eot)([?#]|$)/i.test(url)) fontPats.push(pat);\n      else imgPats.push(pat);\n    });\n\n    var applyTimer = 0;\n    function apply() {\n      applyTimer = 0;\n      var live = [];\n      for (var pat in reps) live.push({ pat: pat, url: reps[pat] });\n      if (!live.length) return;\n      function rewrite(txt) {\n        var out = txt;\n        live.forEach(function (r) {\n          if (out.indexOf(r.pat) === -1) return;\n          out = out.split(r.pat).join('url(\"' + r.url + '\")');\n        });\n        return out;\n      }\n      styles.forEach(function (s) {\n        var txt = String(s.textContent);\n        var out = rewrite(txt);\n        if (out !== txt) { try { s.textContent = out; } catch (e) {} }\n      });\n      styled.forEach(function (el) {\n        var at = el.getAttribute('style');\n        if (!at) return;\n        var out = rewrite(at);\n        if (out !== at) { try { el.setAttribute('style', out); } catch (e) {} }\n      });\n    }\n    function scheduleApply() {\n      if (!applyTimer) applyTimer = setTimeout(apply, 60);\n    }\n    function landed(pat, u) {\n      if (!u) return;\n      reps[pat] = u;\n      scheduleApply();\n    }\n\n    /* background/image tokens: swap in as they arrive */\n    imgPats.forEach(function (pat) {\n      resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) { landed(pat, u); });\n    });\n    /* font tokens: wait for all, then swap once (no metric reflow storm) */\n    Promise.all(fontPats.map(function (pat) {\n      return resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) { return { pat: pat, url: u }; });\n    })).then(function (list) {\n      list.forEach(function (r) { if (r.url) reps[r.pat] = r.url; });\n      apply();\n    });\n    /* safety deadline: apply whatever is ready by now */\n    setTimeout(apply, 3000);\n  }\n\n  /* ---------------- interactions the wiki JS used to provide ----------- */\n\n  /* Sigma-9 side bar (the fixed ≡ button, top-left). The real site opens\n     it with a #side-bar fragment + CSS :target rules; inside a sandboxed\n     srcdoc frame fragment navigation never happens, so the bridge drives\n     the same open/close state with a class + equivalent CSS. */\n\n  function sbIsOpen() {\n    return document.documentElement.classList.contains('scpw-sb');\n  }\n\n  function sbOpen() {\n    if (sbIsOpen()) return;\n    document.documentElement.classList.add('scpw-sb');\n  }\n\n  function sbClose() {\n    document.documentElement.classList.remove('scpw-sb');\n  }\n\n  function scrollToAnchor(id) {\n    id = String(id).replace(/^#/, '');\n    if (!id) return;\n    var el = document.getElementById(id);\n    if (!el) {\n      var named = document.getElementsByName(id);\n      if (named && named.length) el = named[0];\n    }\n    if (el && el.scrollIntoView) el.scrollIntoView(true);\n  }\n\n  /* dropdown parents in the top bar: their \"javascript:;\" hrefs are\n     stripped by the worker, so the bridge toggles the submenu itself */\n  function toggleMenu(li) {\n    var parent = li.parentNode;\n    var willOpen = !li.classList.contains('scpw-open');\n    if (parent && parent.querySelectorAll) {\n      parent.querySelectorAll('li.scpw-open').forEach(function (o) {\n        if (o !== li) o.classList.remove('scpw-open');\n      });\n    }\n    li.classList.toggle('scpw-open', willOpen);\n  }\n\n  function tabviewInit() {\n    document.querySelectorAll('.yui-navset').forEach(function (set) {\n      var lis = set.querySelectorAll('.yui-nav li');\n      var panes = set.querySelectorAll('.yui-content > div');\n      var anyOn = false;\n      for (var i = 0; i < panes.length; i++) { if (panes[i].classList.contains('scpw-on')) anyOn = true; }\n      if (!anyOn) { selectTab(set, 0); }\n    });\n  }\n\n  function selectTab(set, idx) {\n    var lis = set.querySelectorAll('.yui-nav li');\n    var panes = set.querySelectorAll('.yui-content > div');\n    for (var i = 0; i < lis.length; i++) {\n      lis[i].classList.toggle('selected', i === idx);\n      lis[i].classList.toggle('scpw-on', i === idx);\n    }\n    for (var j = 0; j < panes.length; j++) {\n      panes[j].classList.toggle('scpw-on', j === idx);\n      panes[j].classList.toggle('selected', j === idx);\n    }\n  }\n\n  function init() {\n    /* focus-mode styles + tabview styles + broken-image styles */\n    var css = document.createElement('style');\n    css.textContent =\n      'html.scpw-focus #navi-bar,html.scpw-focus #navi-bar-shadow,' +\n      'html.scpw-focus #header,html.scpw-focus #top-bar,' +\n      'html.scpw-focus #side-bar,html.scpw-focus #search-top-box,' +\n      'html.scpw-focus #login-status,html.scpw-focus #footer,' +\n      'html.scpw-focus #page-info,html.scpw-focus .page-tags,' +\n      'html.scpw-focus #footer-bar-below,html.scpw-focus #footer-below' +\n      '{display:none!important}' +\n      'html.scpw-focus #container-wrap{margin-top:0!important}' +\n      'html.scpw-focus #content-wrap{margin:0!important}' +\n      'html.scpw-focus #main-content{margin:0!important}' +\n      '.yui-navset .yui-content>div{display:none}' +\n      '.yui-navset .yui-content>div.scpw-on{display:block}' +\n      '.scpw-broken{opacity:.15!important}' +\n      'a.scpw-file::after{content:\" \\\\2193\";font-size:.8em;opacity:.6}' +\n      /* side-bar open state (class twin of sigma-9's #side-bar:target) */\n      'html.scpw-sb #side-bar{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:15rem!important;max-width:82vw;' +\n      'height:100%!important;overflow-y:auto!important;z-index:9990!important;margin:0!important}' +\n      'html.scpw-sb #side-bar .close-menu{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:100%!important;height:100%!important;' +\n      'background:rgba(0,0,0,.35);z-index:-1;margin:0!important;padding:0!important;border:0}' +\n      /* top-bar dropdowns on touch */\n      '#top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}' +\n      '.mobile-top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}';\n    (document.head || document.documentElement).appendChild(css);\n\n    tabviewInit();\n    activateImages();\n    patchStyles();\n    sendReady();\n  }\n\n  function sendReady() {\n    var d = document.documentElement;\n    send({\n      scpw: 'ready',\n      title: document.title || '',\n      url: CFG.u,\n      scrollH: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n      y: window.scrollY || 0,\n    });\n  }\n\n  /* ---------------- click routing (capture phase) ---------------- */\n\n  document.addEventListener('click', function (e) {\n    if (e.defaultPrevented) return;\n    var t = e.target;\n    var closest = (t && t.closest) ? t.closest.bind(t) : null;\n    if (!closest) return;\n\n    /* tabview tabs */\n    var tabLink = closest('.yui-nav a');\n    if (tabLink) {\n      var set = tabLink.closest('.yui-navset');\n      if (set) {\n        e.preventDefault(); e.stopPropagation();\n        var lis = set.querySelectorAll('.yui-nav li');\n        var li = tabLink.closest('li');\n        var idx = Array.prototype.indexOf.call(lis, li);\n        selectTab(set, idx < 0 ? 0 : idx);\n        return;\n      }\n    }\n\n    /* collapsible blocks */\n    var clps = closest('.collapsible-block-link');\n    if (clps) {\n      var block = clps.closest('.collapsible-block');\n      if (block) {\n        e.preventDefault(); e.stopPropagation();\n        var folded = block.querySelector('.collapsible-block-folded');\n        var unfolded = block.querySelector('.collapsible-block-unfolded');\n        if (folded && unfolded) {\n          var showFolded = unfolded.style.display === 'none' || !unfolded.style.display;\n          folded.style.display = showFolded ? '' : 'none';\n          unfolded.style.display = showFolded ? 'none' : '';\n        }\n        return;\n      }\n    }\n\n    /* file downloads (worker-marked) */\n    var fileLink = closest('a[data-scpw-file]');\n    if (fileLink) {\n      e.preventDefault(); e.stopPropagation();\n      send({ scpw: 'file', href: fileLink.getAttribute('data-scpw-file') });\n      return;\n    }\n\n    /* form submit buttons: the frame sandbox blocks real form submission\n       (no allow-forms), so the bridge resolves the form itself. Must run\n       before the no-href/link branches below. */\n    var subBtn = null;\n    if ((t.tagName === 'INPUT' || t.tagName === 'BUTTON') && t.closest && t.closest('form')) {\n      var sTy = String(t.getAttribute('type') || (t.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();\n      if (sTy === 'submit' || sTy === 'image') subBtn = t;\n    }\n    if (subBtn) {\n      e.preventDefault(); e.stopPropagation();\n      handleForm(subBtn.closest('form'), subBtn);\n      return;\n    }\n\n    /* dropdown parents (wikidot \"javascript:;\" links - href stripped) */\n    var anyA = closest('a');\n    if (anyA && !anyA.getAttribute('href')) {\n      var li = anyA.closest('li');\n      if (li && li.querySelector('ul')) {\n        e.preventDefault(); e.stopPropagation();\n        toggleMenu(li);\n        return;\n      }\n    }\n\n    /* normal links */\n    var a = closest('a[href]');\n    if (!a) return;\n    var href = a.getAttribute('href') || '';\n    if (!href) return;\n    if (href.charAt(0) === '#') {\n      /* fragment links never navigate inside the sandbox: the sigma side\n         bar menu, its close scrim and in-page anchors are handled here */\n      e.preventDefault(); e.stopPropagation();\n      var frag = href.slice(1);\n      if (closest('.close-menu')) { sbClose(); return; }\n      if (frag === 'side-bar') { if (sbIsOpen()) sbClose(); else sbOpen(); return; }\n      if (!frag) { sbClose(); return; }\n      scrollToAnchor(frag);\n      return;\n    }\n    if (/^(javascript|mailto|tel|sms|about|data|blob):/i.test(href)) {\n      e.preventDefault();\n      if (/^mailto:|^tel:/i.test(href)) send({ scpw: 'ext', href: href, kind: 'contact' });\n      return;\n    }\n    e.preventDefault();\n    send({ scpw: 'nav', href: href });\n  }, true);\n\n  /* ---------------- forms (GET becomes navigation) ----------------\n\n     The sandboxed frame has no allow-forms, so real submit events never\n     fire: submit-button clicks and Enter-in-textfield are captured instead\n     and resolved here. The submit listener stays as a backstop. */\n\n  function handleForm(f, submitter) {\n    if (!f || !f.tagName || f.tagName.toUpperCase() !== 'FORM') return;\n    var method = (f.getAttribute('method') || 'get').toLowerCase();\n    var action = f.getAttribute('action') || CFG.u;\n    /* wikidot's search box carries a placeholder action (\"dummy\") that its\n       own scripts would rewrite at runtime; route it to the app's search */\n    if (/\\/dummy\\/?$/.test(action) || f.id === 'search-top-box-form') {\n      var sq = '';\n      try {\n        new FormData(f).forEach(function (v, k) {\n          if (k === 'query' && typeof v === 'string' && String(v).trim()) sq = String(v).trim();\n        });\n      } catch (err) {}\n      if (sq) send({ scpw: 'search', q: sq });\n      return;\n    }\n    if (method !== 'get') {\n      send({ scpw: 'blocked', reason: 'post', href: action });\n      return;\n    }\n    try {\n      var qs = new URLSearchParams();\n      new FormData(f).forEach(function (v, k) {\n        if (typeof v === 'string') qs.append(k, v);\n      });\n      if (submitter && submitter.name) qs.append(submitter.name, submitter.value || '');\n      var q = qs.toString();\n      send({ scpw: 'nav', href: action + (q ? (action.indexOf('?') > -1 ? '&' : '?') + q : '') });\n    } catch (err) {\n      send({ scpw: 'blocked', reason: 'form', href: action });\n    }\n  }\n\n  /* Enter in a text field = implicit form submission */\n  document.addEventListener('keydown', function (e) {\n    if (e.key !== 'Enter' || e.defaultPrevented) return;\n    var t = e.target;\n    if (!t || !t.closest || t.tagName !== 'INPUT') return;\n    var ty = String(t.getAttribute('type') || 'text').toLowerCase();\n    if (!/^(text|search|email|url|number|tel|password)$/.test(ty)) return;\n    var form = t.closest('form');\n    if (!form) return;\n    e.preventDefault(); e.stopPropagation();\n    handleForm(form, null);\n  }, true);\n\n  document.addEventListener('submit', function (e) {\n    e.preventDefault(); e.stopPropagation();\n    handleForm(e.target, null);\n  }, true);\n\n  /* ---------------- scroll reporting ---------------- */\n\n  var lastSent = 0;\n  function reportScroll(force) {\n    var now = Date.now();\n    if (!force && now - lastSent < 250) return;\n    lastSent = now;\n    var d = document.documentElement;\n    send({\n      scpw: 'scroll',\n      y: Math.round(window.scrollY || document.body.scrollTop || 0),\n      h: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n    });\n  }\n  window.addEventListener('scroll', function () { reportScroll(false); }, { passive: true });\n\n  /* ---------------- parent commands ---------------- */\n\n  window.addEventListener('message', function (e) {\n    var d = e.data;\n    if (!d || d.scpw !== 'cmd') return;\n    if (d.op === 'scrollTo') {\n      window.scrollTo(0, d.y || 0);\n    } else if (d.op === 'anchor') {\n      var id = String(d.a || '').replace(/^#/, '');\n      if (id) {\n        var el = document.getElementById(id);\n        if (!el) {\n          var named = document.getElementsByName(id);\n          if (named && named.length) el = named[0];\n        }\n        if (el && el.scrollIntoView) el.scrollIntoView(true);\n        else window.scrollTo(0, 0);\n      }\n    } else if (d.op === 'zoom') {\n      document.body.style.zoom = d.z || 1;\n      var vp = document.querySelector('meta[name=viewport]');\n      if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1');\n    } else if (d.op === 'focus') {\n      document.documentElement.classList.toggle('scpw-focus', !!d.on);\n    } else if (d.op === 'ping') {\n      sendReady();\n    } else if (d.op === 'top') {\n      window.scrollTo(0, 0);\n    }\n  });\n\n  /* ---------------- boot ---------------- */\n\n  window.SCPW_INIT = function (cfg) {\n    CFG = cfg || {};\n    if (document.readyState === 'loading') {\n      document.addEventListener('DOMContentLoaded', function () { init(); });\n    } else {\n      init();\n    }\n  };\n})();\n";
 
 function makeRewriter(finalUrl) {
   const R = {
@@ -352,6 +567,7 @@ function makeRewriter(finalUrl) {
     n: 0,
     title: '',
     icon: '',
+    budget: INLINE_BUDGET,   /* bytes of data-URIs allowed in this render */
     token(abs) {
       for (const k in this.map) if (this.map[k] === abs) return k;
       const t = 'SCPW_A' + (this.n++);
@@ -496,19 +712,38 @@ async function rewriteDocument(html, R, env, workerOrigin) {
     return abs ? setAttr(tag, 'action', abs) : tag;
   });
 
-  /* --- 12. inline style attributes: tokenize url() --- */
+  /* --- 12. inline style attributes: resolve url() (inline or token) --- */
+  const attrRefs = [];
+  const attrMarks = [];
   html = html.replace(/\sstyle\s*=\s*("([^"]*)"|'([^']*)')/gi, (m, all, dq, sq) => {
     const css = dq !== undefined ? dq : sq;
-    const fixed = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)/gi, (mm, d2, s2, u2) => {
+    let marked = css;
+    const before = attrRefs.length;
+    marked = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)/gi, (mm, d2, s2, u2) => {
       const raw = d2 !== undefined ? d2 : (s2 !== undefined ? s2 : u2);
       if (raw == null || !raw || /^data:/i.test(raw)) return mm;
       const abs = absUrl(String(raw).trim(), R.base);
       if (!abs || !assetUrlOk(new URL(abs), env)) return mm;
-      return 'url("data:,' + R.token(abs) + '")';
+      return '\x00U' + (attrRefs.push(abs) - 1) + '\x00';
     });
-    if (fixed === css) return m;
-    return ' style="' + encodeEnt(fixed) + '"';
+    if (attrRefs.length === before) return m;
+    attrMarks.push({ marked: marked, quote: dq !== undefined ? '"' : "'" });
+    return ' style=\x00M' + (attrMarks.length - 1) + '\x00';
   });
+  if (attrRefs.length) {
+    const reps = await Promise.all(attrRefs.map(abs =>
+      inlineDataUri(abs, env, R).then(dataUri =>
+        dataUri ? 'url("' + dataUri + '")' : 'url("data:,' + R.token(abs) + '")')));
+    attrMarks.forEach(function (mk, i) {
+      let out = mk.marked;
+      /* sentinels inside the attribute text; index space is shared with attrRefs */
+      for (var j = 0; j < attrRefs.length; j++) {
+        out = out.split('\x00U' + j + '\x00').join(reps[j]);
+      }
+      var enc = encodeEnt(out);
+      html = html.split(' style=\x00M' + i + '\x00').join(' style=' + mk.quote + enc + mk.quote);
+    });
+  }
 
   /* --- 13. title --- */
   const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title\s*>/i);
@@ -670,6 +905,11 @@ async function apiRender(request, env, ctx, url) {
   PAGE_INFLIGHT.set(cacheKey, p);
   try {
     const pkg = await p;
+    /* prefetch the page's images into the warm cache while the client
+       is still parsing the render package (ctx.waitUntil, best-effort) */
+    if (ctx && pkg.assets) {
+      try { ctx.waitUntil(warmAssets(pkg.assets)); } catch (e) {}
+    }
     const out = json(pkg, 200, { 'cache-control': 'public, max-age=120' });
     if (ctx && typeof caches !== 'undefined') {
       try { ctx.waitUntil(caches.default.put(new Request(cacheKey, { method: 'GET' }), out.clone())); } catch (e) {}
@@ -716,6 +956,66 @@ async function apiAsset(request, env, ctx, url) {
     } catch (e) {}
   }
 
+  /* Warm memory cache: assets prefetched at render time (and small
+     images/fonts served recently) answer from isolate memory - this is
+     what makes "art takes forever" go away, because the slow wdfiles
+     origin is only contacted once, server-side. */
+  const mem = BLOB_MEM.get(upstream);
+  if (request.method === 'GET' && mem && Date.now() - mem.at < BLOB_MEM_TTL) {
+    return blobMemResponse(mem);
+  }
+
+  /* Range requests and unknown/huge sizes stream straight through. */
+  const hasRange = request.headers.get('range');
+  if (hasRange) return assetStream(request, env, ctx, tu, upstream, cacheKey);
+
+  /* everything else buffers once (deduped against the render warm-up
+     via BUF_INFLIGHT) and lands in memory when it is cache-sized */
+  let entry;
+  try {
+    entry = await fetchAssetBuffered(upstream, {
+      method: 'GET',
+      headers: {
+        'accept': 'image/*,font/*,text/css,*/*;q=0.8',
+        'user-agent': UA_MOBILE,
+        'referer': tu.origin + '/',
+      },
+      redirect: 'follow',
+    });
+  } catch (e) {
+    return json({ ok: false, error: 'asset unreachable', detail: String((e && e.message) || e) }, 502);
+  }
+
+  if (/text\/html|application\/xhtml/.test(entry.ct)) {
+    return json({ ok: false, error: 'html not proxied', detail: 'assets only - pages come from /api/render' }, 415);
+  }
+  if (entry.buf.byteLength > MAX_ASSET) return json({ ok: false, error: 'asset too large' }, 413);
+
+  if (entry.status === 200 && entry.buf.byteLength &&
+      entry.buf.byteLength <= BLOB_MEM_BYTES && /image\/|font\/|text\/css/.test(entry.ct)) {
+    BLOB_MEM.set(upstream, { at: Date.now(), status: entry.status, ct: entry.ct, etag: entry.etag, lastMod: entry.lastMod, buf: entry.buf });
+    blobMemTotal += entry.buf.byteLength;
+    blobMemTrim();
+  }
+
+  return blobMemResponse(entry);
+}
+
+function blobMemResponse(e) {
+  const h = new Headers();
+  h.set('content-type', e.ct || 'application/octet-stream');
+  if (e.etag) h.set('etag', e.etag);
+  if (e.lastMod) h.set('last-modified', e.lastMod);
+  h.set('access-control-allow-origin', '*');
+  h.set('cache-control', 'public, max-age=' + (/image\/|font\//.test(e.ct) ? '2592000' : '86400'));
+  h.set('x-scp-proxy', VERSION);
+  h.set('x-scp-cache', 'mem');
+  /* copy the buffer: one ArrayBuffer must not back two live bodies */
+  return new Response(e.buf.slice(0), { status: e.status || 200, headers: h });
+}
+
+/* streaming path for huge / range assets */
+async function assetStream(request, env, ctx, tu, upstream, cacheKey) {
   let res;
   try {
     res = await fetchWithTimeout(upstream, {
@@ -743,7 +1043,7 @@ async function apiAsset(request, env, ctx, url) {
   keep.forEach(k => { const v = res.headers.get(k); if (v != null) h.set(k, v); });
   if (!h.has('content-type')) h.set('content-type', 'application/octet-stream');
   h.set('access-control-allow-origin', '*');
-  h.set('cache-control', 'public, max-age=86400');
+  h.set('cache-control', 'public, max-age=' + (/image\/|font\//.test(ctype) ? '2592000' : '86400'));
   h.set('x-scp-proxy', VERSION);
 
   if (request.method === 'HEAD') return new Response(null, { status: res.status, headers: h });
@@ -761,7 +1061,7 @@ async function apiAsset(request, env, ctx, url) {
 /* Crom GraphQL helpers (search + random)                              */
 /* ------------------------------------------------------------------ */
 
-async function cromQuery(query, variables) {
+async function cromQueryOnce(query, variables) {
   const res = await Promise.race([
     fetch(CROM_GRAPHQL, {
       method: 'POST',
@@ -775,6 +1075,21 @@ async function cromQuery(query, variables) {
   if (j.errors && j.errors.length) throw new Error('crom error: ' +
     (j.errors[0] && j.errors[0].message ? j.errors[0].message : 'graph error'));
   return j.data || {};
+}
+
+/* Crom occasionally answers 5xx or just stalls; one retry after a short
+   backoff rescues transient failures so search rarely surfaces an error. */
+async function cromQuery(query, variables) {
+  try {
+    return await cromQueryOnce(query, variables);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/timeout|http 5\d\d|network|failed to fetch/i.test(msg)) {
+      await new Promise(r => setTimeout(r, 400));
+      return await cromQueryOnce(query, variables);
+    }
+    throw e;
+  }
 }
 
 /* Crom's anyBaseUrl filter has changed schema type over time (String vs
@@ -830,7 +1145,9 @@ async function apiSearch(request, env, url) {
     });
     return json({ ok: true, q: q, site: site, results: results });
   } catch (e) {
-    return json({ ok: false, error: 'search unavailable', detail: String((e && e.message) || e) }, 502);
+    return json({ ok: false, error: 'search unavailable',
+      detail: String((e && e.message) || e) +
+        ' (Crom search API - if this keeps happening, update the worker to v' + VERSION + ')' }, 502);
   }
 }
 

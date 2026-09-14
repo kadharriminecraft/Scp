@@ -56,7 +56,7 @@
 
 export default { fetch: handle };
 
-const VERSION = '3.3.0';
+const VERSION = '3.4.0';
 const DEFAULT_SITE_DEFAULT = 'scp-wiki.wikidot.com';
 const CROM_GRAPHQL = 'https://api.crom.avn.sh/graphql';
 
@@ -557,7 +557,73 @@ async function inlineCss(css, base, env, R, depth) {
 /* HTML render engine                                                  */
 /* ------------------------------------------------------------------ */
 
-const BRIDGE_SRC = "/* SCPW BRIDGE - injected into every rendered page by the worker.\n   Runs inside a sandboxed iframe (unique origin, scripts allowed).\n   Responsibilities:\n     - lazy-load images + CSS assets through the worker (/api/asset)\n     - report navigation clicks / form submits to the parent browser\n     - reimplement the wiki interactions that need JS (collapsibles,\n       tabviews, the sigma-9 side-bar menu, top-bar dropdowns) because\n       the page's own scripts are stripped\n     - report scroll position + accept parent commands (scrollTo,\n       zoom, focus mode)\n   The worker appends an init call:  SCPW_INIT({w, a, u})   */\n\n(function () {\n  'use strict';\n\n  var CFG = null;          /* {w: worker origin, a: {token: url}, u: page url} */\n  var CACHE = {};          /* token -> blob url ('' = failed) */\n  var parentWin = window.parent;\n\n  function send(msg) {\n    try { parentWin.postMessage(msg, '*'); } catch (e) {}\n  }\n\n  /* ---------------- asset pipeline (through the worker) ---------------- */\n\n  function fetchAsset(url) {\n    return fetch(CFG.w + '/api/asset?url=' + encodeURIComponent(url), {\n      credentials: 'omit',\n    }).then(function (r) {\n      if (!r.ok) throw new Error('asset http ' + r.status);\n      return r.blob();\n    }).then(function (b) {\n      return URL.createObjectURL(b);\n    });\n  }\n\n  function resolveToken(tok) {\n    var c = CACHE[tok];\n    if (c !== undefined) return (c && typeof c.then === 'function') ? c : Promise.resolve(c);\n    var url = CFG.a[tok];\n    if (!url) return Promise.resolve('');\n    var p = fetchAsset(url).then(function (u) {\n      CACHE[tok] = u;\n      return u;\n    }, function () {\n      CACHE[tok] = '';\n      return '';\n    });\n    CACHE[tok] = p;\n    return p;\n  }\n\n  var TOKRE = /url\\(\"data:,(SCPW_A\\d+)\"\\)/g;\n\n  /* Images: placeholder src is a 1px gif; data-scpw holds the token.\n     The blob is decoded BEFORE the swap so the intrinsic size is known:\n     width/height attributes (lowest CSS priority, so site styles still\n     win) are written in the SAME frame as src. The placeholder then\n     already occupies the final box and no layout shift happens when\n     the pixels land - this is what made the text jitter while pages\n     settled. */\n  function swapImage(el) {\n    var tok = el.getAttribute('data-scpw');\n    if (!tok) return;\n    resolveToken(tok).then(function (u) {\n      el.removeAttribute('data-scpw');\n      if (!u) { el.classList.add('scpw-broken'); return; }\n      var probe = new Image();\n      probe.onload = function () {\n        if (probe.naturalWidth && probe.naturalHeight &&\n            !el.hasAttribute('width') && !el.hasAttribute('height')) {\n          el.setAttribute('width', probe.naturalWidth);\n          el.setAttribute('height', probe.naturalHeight);\n        }\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.onerror = function () {\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.src = u;   /* blob is already fetched: decode is near-instant */\n    });\n  }\n\n  function activateImages() {\n    var imgs = document.querySelectorAll('img[data-scpw]');\n    var list = Array.prototype.slice.call(imgs);\n    if (!('IntersectionObserver' in window)) {\n      list.forEach(function (el) { swapImage(el); });\n      return;\n    }\n    /* generous margin: images arrive well before they scroll into\n       view, so late loads never visibly move the text; entries that\n       already intersect fire immediately at observe time */\n    var io = new IntersectionObserver(function (entries) {\n      entries.forEach(function (e) {\n        if (e.isIntersecting) { io.unobserve(e.target); swapImage(e.target); }\n      });\n    }, { rootMargin: '1500px 0px' });\n    list.forEach(function (el) { io.observe(el); });\n  }\n\n  /* CSS: url() references arrive as non-fetching data: placeholders that\n     carry the token:  url(\"data:,SCPW_A7\"). Most small chrome images and\n     fonts are already inlined as data: URIs by the worker; the tokens\n     that remain are resolved here. Background images are applied as\n     each lands (they never move text), fonts are applied in ONE pass\n     so text metrics swap once - and a safety timer guarantees a slow\n     straggler can never hold the page's backgrounds hostage. */\n\n  function patchStyles() {\n    var styles = Array.prototype.slice.call(document.querySelectorAll('style'));\n    var styled = Array.prototype.slice.call(document.querySelectorAll('[style]'));\n    var needed = {};\n    function collect(txt) {\n      var found = String(txt).match(TOKRE);\n      if (found) found.forEach(function (f) { needed[f] = 1; });\n    }\n    styles.forEach(function (s) { collect(s.textContent); });\n    styled.forEach(function (el) { collect(el.getAttribute('style') || ''); });\n    var pats = Object.keys(needed);\n    if (!pats.length) return;\n\n    var reps = {};        /* pat -> resolved blob url */\n    var fontPats = [], imgPats = [];\n    pats.forEach(function (pat) {\n      var tok = pat.match(/SCPW_A\\d+/)[0];\n      var url = CFG.a[tok] || '';\n      if (/\\.(woff2?|ttf|otf|eot)([?#]|$)/i.test(url)) fontPats.push(pat);\n      else imgPats.push(pat);\n    });\n\n    var applyTimer = 0;\n    function apply() {\n      applyTimer = 0;\n      var live = [];\n      for (var pat in reps) live.push({ pat: pat, url: reps[pat] });\n      if (!live.length) return;\n      function rewrite(txt) {\n        var out = txt;\n        live.forEach(function (r) {\n          if (out.indexOf(r.pat) === -1) return;\n          out = out.split(r.pat).join('url(\"' + r.url + '\")');\n        });\n        return out;\n      }\n      styles.forEach(function (s) {\n        var txt = String(s.textContent);\n        var out = rewrite(txt);\n        if (out !== txt) { try { s.textContent = out; } catch (e) {} }\n      });\n      styled.forEach(function (el) {\n        var at = el.getAttribute('style');\n        if (!at) return;\n        var out = rewrite(at);\n        if (out !== at) { try { el.setAttribute('style', out); } catch (e) {} }\n      });\n    }\n    function scheduleApply() {\n      if (!applyTimer) applyTimer = setTimeout(apply, 60);\n    }\n    function landed(pat, u) {\n      if (!u) return;\n      reps[pat] = u;\n      scheduleApply();\n    }\n\n    /* background/image tokens: swap in as they arrive */\n    imgPats.forEach(function (pat) {\n      resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) { landed(pat, u); });\n    });\n    /* font tokens: wait for all, then swap once (no metric reflow storm) */\n    Promise.all(fontPats.map(function (pat) {\n      return resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) { return { pat: pat, url: u }; });\n    })).then(function (list) {\n      list.forEach(function (r) { if (r.url) reps[r.pat] = r.url; });\n      apply();\n    });\n    /* safety deadline: apply whatever is ready by now */\n    setTimeout(apply, 3000);\n  }\n\n  /* ---------------- interactions the wiki JS used to provide ----------- */\n\n  /* Sigma-9 side bar (the fixed ≡ button, top-left). The real site opens\n     it with a #side-bar fragment + CSS :target rules; inside a sandboxed\n     srcdoc frame fragment navigation never happens, so the bridge drives\n     the same open/close state with a class + equivalent CSS. */\n\n  function sbIsOpen() {\n    return document.documentElement.classList.contains('scpw-sb');\n  }\n\n  function sbOpen() {\n    if (sbIsOpen()) return;\n    document.documentElement.classList.add('scpw-sb');\n  }\n\n  function sbClose() {\n    document.documentElement.classList.remove('scpw-sb');\n  }\n\n  function scrollToAnchor(id) {\n    id = String(id).replace(/^#/, '');\n    if (!id) return;\n    var el = document.getElementById(id);\n    if (!el) {\n      var named = document.getElementsByName(id);\n      if (named && named.length) el = named[0];\n    }\n    if (el && el.scrollIntoView) el.scrollIntoView(true);\n  }\n\n  /* dropdown parents in the top bar: their \"javascript:;\" hrefs are\n     stripped by the worker, so the bridge toggles the submenu itself */\n  function toggleMenu(li) {\n    var parent = li.parentNode;\n    var willOpen = !li.classList.contains('scpw-open');\n    if (parent && parent.querySelectorAll) {\n      parent.querySelectorAll('li.scpw-open').forEach(function (o) {\n        if (o !== li) o.classList.remove('scpw-open');\n      });\n    }\n    li.classList.toggle('scpw-open', willOpen);\n  }\n\n  function tabviewInit() {\n    document.querySelectorAll('.yui-navset').forEach(function (set) {\n      var lis = set.querySelectorAll('.yui-nav li');\n      var panes = set.querySelectorAll('.yui-content > div');\n      var anyOn = false;\n      for (var i = 0; i < panes.length; i++) { if (panes[i].classList.contains('scpw-on')) anyOn = true; }\n      if (!anyOn) { selectTab(set, 0); }\n    });\n  }\n\n  function selectTab(set, idx) {\n    var lis = set.querySelectorAll('.yui-nav li');\n    var panes = set.querySelectorAll('.yui-content > div');\n    for (var i = 0; i < lis.length; i++) {\n      lis[i].classList.toggle('selected', i === idx);\n      lis[i].classList.toggle('scpw-on', i === idx);\n    }\n    for (var j = 0; j < panes.length; j++) {\n      panes[j].classList.toggle('scpw-on', j === idx);\n      panes[j].classList.toggle('selected', j === idx);\n    }\n  }\n\n  function init() {\n    /* focus-mode styles + tabview styles + broken-image styles */\n    var css = document.createElement('style');\n    css.textContent =\n      'html.scpw-focus #navi-bar,html.scpw-focus #navi-bar-shadow,' +\n      'html.scpw-focus #header,html.scpw-focus #top-bar,' +\n      'html.scpw-focus #side-bar,html.scpw-focus #search-top-box,' +\n      'html.scpw-focus #login-status,html.scpw-focus #footer,' +\n      'html.scpw-focus #page-info,html.scpw-focus .page-tags,' +\n      'html.scpw-focus #footer-bar-below,html.scpw-focus #footer-below' +\n      '{display:none!important}' +\n      'html.scpw-focus #container-wrap{margin-top:0!important}' +\n      'html.scpw-focus #content-wrap{margin:0!important}' +\n      'html.scpw-focus #main-content{margin:0!important}' +\n      '.yui-navset .yui-content>div{display:none}' +\n      '.yui-navset .yui-content>div.scpw-on{display:block}' +\n      '.scpw-broken{opacity:.15!important}' +\n      'a.scpw-file::after{content:\" \\\\2193\";font-size:.8em;opacity:.6}' +\n      /* side-bar open state (class twin of sigma-9's #side-bar:target) */\n      'html.scpw-sb #side-bar{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:15rem!important;max-width:82vw;' +\n      'height:100%!important;overflow-y:auto!important;z-index:9990!important;margin:0!important}' +\n      'html.scpw-sb #side-bar .close-menu{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:100%!important;height:100%!important;' +\n      'background:rgba(0,0,0,.35);z-index:-1;margin:0!important;padding:0!important;border:0}' +\n      /* top-bar dropdowns on touch */\n      '#top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}' +\n      '.mobile-top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}';\n    (document.head || document.documentElement).appendChild(css);\n\n    tabviewInit();\n    activateImages();\n    patchStyles();\n    sendReady();\n  }\n\n  function sendReady() {\n    var d = document.documentElement;\n    send({\n      scpw: 'ready',\n      title: document.title || '',\n      url: CFG.u,\n      scrollH: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n      y: window.scrollY || 0,\n    });\n  }\n\n  /* ---------------- click routing (capture phase) ---------------- */\n\n  document.addEventListener('click', function (e) {\n    if (e.defaultPrevented) return;\n    var t = e.target;\n    var closest = (t && t.closest) ? t.closest.bind(t) : null;\n    if (!closest) return;\n\n    /* tabview tabs */\n    var tabLink = closest('.yui-nav a');\n    if (tabLink) {\n      var set = tabLink.closest('.yui-navset');\n      if (set) {\n        e.preventDefault(); e.stopPropagation();\n        var lis = set.querySelectorAll('.yui-nav li');\n        var li = tabLink.closest('li');\n        var idx = Array.prototype.indexOf.call(lis, li);\n        selectTab(set, idx < 0 ? 0 : idx);\n        return;\n      }\n    }\n\n    /* collapsible blocks */\n    var clps = closest('.collapsible-block-link');\n    if (clps) {\n      var block = clps.closest('.collapsible-block');\n      if (block) {\n        e.preventDefault(); e.stopPropagation();\n        var folded = block.querySelector('.collapsible-block-folded');\n        var unfolded = block.querySelector('.collapsible-block-unfolded');\n        if (folded && unfolded) {\n          var showFolded = unfolded.style.display === 'none' || !unfolded.style.display;\n          folded.style.display = showFolded ? '' : 'none';\n          unfolded.style.display = showFolded ? 'none' : '';\n        }\n        return;\n      }\n    }\n\n    /* file downloads (worker-marked) */\n    var fileLink = closest('a[data-scpw-file]');\n    if (fileLink) {\n      e.preventDefault(); e.stopPropagation();\n      send({ scpw: 'file', href: fileLink.getAttribute('data-scpw-file') });\n      return;\n    }\n\n    /* form submit buttons: the frame sandbox blocks real form submission\n       (no allow-forms), so the bridge resolves the form itself. Must run\n       before the no-href/link branches below. */\n    var subBtn = null;\n    if ((t.tagName === 'INPUT' || t.tagName === 'BUTTON') && t.closest && t.closest('form')) {\n      var sTy = String(t.getAttribute('type') || (t.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();\n      if (sTy === 'submit' || sTy === 'image') subBtn = t;\n    }\n    if (subBtn) {\n      e.preventDefault(); e.stopPropagation();\n      handleForm(subBtn.closest('form'), subBtn);\n      return;\n    }\n\n    /* dropdown parents (wikidot \"javascript:;\" links - href stripped) */\n    var anyA = closest('a');\n    if (anyA && !anyA.getAttribute('href')) {\n      var li = anyA.closest('li');\n      if (li && li.querySelector('ul')) {\n        e.preventDefault(); e.stopPropagation();\n        toggleMenu(li);\n        return;\n      }\n    }\n\n    /* normal links */\n    var a = closest('a[href]');\n    if (!a) return;\n    var href = a.getAttribute('href') || '';\n    if (!href) return;\n    if (href.charAt(0) === '#') {\n      /* fragment links never navigate inside the sandbox: the sigma side\n         bar menu, its close scrim and in-page anchors are handled here */\n      e.preventDefault(); e.stopPropagation();\n      var frag = href.slice(1);\n      if (closest('.close-menu')) { sbClose(); return; }\n      if (frag === 'side-bar') { if (sbIsOpen()) sbClose(); else sbOpen(); return; }\n      if (!frag) { sbClose(); return; }\n      scrollToAnchor(frag);\n      return;\n    }\n    if (/^(javascript|mailto|tel|sms|about|data|blob):/i.test(href)) {\n      e.preventDefault();\n      if (/^mailto:|^tel:/i.test(href)) send({ scpw: 'ext', href: href, kind: 'contact' });\n      return;\n    }\n    e.preventDefault();\n    send({ scpw: 'nav', href: href });\n  }, true);\n\n  /* ---------------- forms (GET becomes navigation) ----------------\n\n     The sandboxed frame has no allow-forms, so real submit events never\n     fire: submit-button clicks and Enter-in-textfield are captured instead\n     and resolved here. The submit listener stays as a backstop. */\n\n  function handleForm(f, submitter) {\n    if (!f || !f.tagName || f.tagName.toUpperCase() !== 'FORM') return;\n    var method = (f.getAttribute('method') || 'get').toLowerCase();\n    var action = f.getAttribute('action') || CFG.u;\n    /* wikidot's search box carries a placeholder action (\"dummy\") that its\n       own scripts would rewrite at runtime; route it to the app's search */\n    if (/\\/dummy\\/?$/.test(action) || f.id === 'search-top-box-form') {\n      var sq = '';\n      try {\n        new FormData(f).forEach(function (v, k) {\n          if (k === 'query' && typeof v === 'string' && String(v).trim()) sq = String(v).trim();\n        });\n      } catch (err) {}\n      if (sq) send({ scpw: 'search', q: sq });\n      return;\n    }\n    if (method !== 'get') {\n      send({ scpw: 'blocked', reason: 'post', href: action });\n      return;\n    }\n    try {\n      var qs = new URLSearchParams();\n      new FormData(f).forEach(function (v, k) {\n        if (typeof v === 'string') qs.append(k, v);\n      });\n      if (submitter && submitter.name) qs.append(submitter.name, submitter.value || '');\n      var q = qs.toString();\n      send({ scpw: 'nav', href: action + (q ? (action.indexOf('?') > -1 ? '&' : '?') + q : '') });\n    } catch (err) {\n      send({ scpw: 'blocked', reason: 'form', href: action });\n    }\n  }\n\n  /* Enter in a text field = implicit form submission */\n  document.addEventListener('keydown', function (e) {\n    if (e.key !== 'Enter' || e.defaultPrevented) return;\n    var t = e.target;\n    if (!t || !t.closest || t.tagName !== 'INPUT') return;\n    var ty = String(t.getAttribute('type') || 'text').toLowerCase();\n    if (!/^(text|search|email|url|number|tel|password)$/.test(ty)) return;\n    var form = t.closest('form');\n    if (!form) return;\n    e.preventDefault(); e.stopPropagation();\n    handleForm(form, null);\n  }, true);\n\n  document.addEventListener('submit', function (e) {\n    e.preventDefault(); e.stopPropagation();\n    handleForm(e.target, null);\n  }, true);\n\n  /* ---------------- scroll reporting ---------------- */\n\n  var lastSent = 0;\n  function reportScroll(force) {\n    var now = Date.now();\n    if (!force && now - lastSent < 250) return;\n    lastSent = now;\n    var d = document.documentElement;\n    send({\n      scpw: 'scroll',\n      y: Math.round(window.scrollY || document.body.scrollTop || 0),\n      h: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n    });\n  }\n  window.addEventListener('scroll', function () { reportScroll(false); }, { passive: true });\n\n  /* ---------------- parent commands ---------------- */\n\n  window.addEventListener('message', function (e) {\n    var d = e.data;\n    if (!d || d.scpw !== 'cmd') return;\n    if (d.op === 'scrollTo') {\n      window.scrollTo(0, d.y || 0);\n    } else if (d.op === 'anchor') {\n      var id = String(d.a || '').replace(/^#/, '');\n      if (id) {\n        var el = document.getElementById(id);\n        if (!el) {\n          var named = document.getElementsByName(id);\n          if (named && named.length) el = named[0];\n        }\n        if (el && el.scrollIntoView) el.scrollIntoView(true);\n        else window.scrollTo(0, 0);\n      }\n    } else if (d.op === 'zoom') {\n      document.body.style.zoom = d.z || 1;\n      var vp = document.querySelector('meta[name=viewport]');\n      if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1');\n    } else if (d.op === 'focus') {\n      document.documentElement.classList.toggle('scpw-focus', !!d.on);\n    } else if (d.op === 'ping') {\n      sendReady();\n    } else if (d.op === 'top') {\n      window.scrollTo(0, 0);\n    }\n  });\n\n  /* ---------------- boot ---------------- */\n\n  window.SCPW_INIT = function (cfg) {\n    CFG = cfg || {};\n    if (document.readyState === 'loading') {\n      document.addEventListener('DOMContentLoaded', function () { init(); });\n    } else {\n      init();\n    }\n  };\n})();\n";
+const BRIDGE_SRC = "/* SCPW BRIDGE - injected into every rendered page by the worker.\n   Runs inside a sandboxed iframe (unique origin, scripts allowed).\n   Responsibilities:\n     - lazy-load images + CSS assets through the worker (/api/asset)\n     - report navigation clicks / form submits to the parent browser\n     - reimplement the wiki interactions that need JS (collapsibles,\n       tabviews, the sigma-9 side-bar menu, top-bar dropdowns) because\n       the page's own scripts are stripped\n     - report scroll position + accept parent commands (scrollTo,\n       zoom, focus mode)\n   The worker appends an init call:  SCPW_INIT({w, a, u})   */\n\n(function () {\n  'use strict';\n\n  var CFG = null;          /* {w: worker origin, a: {token: url}, u: page url} */\n  var CACHE = {};          /* token -> blob url ('' = failed) */\n  var parentWin = window.parent;\n\n  function send(msg) {\n    try { parentWin.postMessage(msg, '*'); } catch (e) {}\n  }\n\n  /* ---------------- asset pipeline (through the worker) ---------------- */\n\n  function fetchAsset(url) {\n    return fetch(CFG.w + '/api/asset?url=' + encodeURIComponent(url), {\n      credentials: 'omit',\n    }).then(function (r) {\n      if (!r.ok) throw new Error('asset http ' + r.status);\n      return r.blob();\n    }).then(function (b) {\n      return URL.createObjectURL(b);\n    });\n  }\n\n  function resolveToken(tok) {\n    var c = CACHE[tok];\n    if (c !== undefined) return (c && typeof c.then === 'function') ? c : Promise.resolve(c);\n    var url = CFG.a[tok];\n    if (!url) return Promise.resolve('');\n    var p = fetchAsset(url).then(function (u) {\n      CACHE[tok] = u;\n      return u;\n    }, function () {\n      CACHE[tok] = '';\n      return '';\n    });\n    CACHE[tok] = p;\n    return p;\n  }\n\n  var TOKRE = /url\\(\"data:,(SCPW_A\\d+)\"\\)/g;\n\n  /* Images: placeholder src is a 1px gif; data-scpw holds the token.\n     The blob is decoded BEFORE the swap so the intrinsic size is known:\n     width/height attributes (lowest CSS priority, so site styles still\n     win) are written in the SAME frame as src. The placeholder then\n     already occupies the final box and no layout shift happens when\n     the pixels land - this is what made the text jitter while pages\n     settled.\n     The written height ATTRIBUTE alone would distort any image whose\n     CSS constrains only the width (sigma-9's .scp-image-block img has\n     width:100% and no height) - so every image the bridge sizes is also\n     marked data-scpw-r, and init() adds :where(img[data-scpw-r]){height:auto}.\n     Zero specificity means any real site height rule still wins; the\n     attribute hint is overridden and the attrs' aspect-ratio keeps the\n     reserved box proportional. */\n  function swapImage(el) {\n    var tok = el.getAttribute('data-scpw');\n    if (!tok) return;\n    resolveToken(tok).then(function (u) {\n      el.removeAttribute('data-scpw');\n      if (!u) { el.classList.add('scpw-broken'); return; }\n      var probe = new Image();\n      probe.onload = function () {\n        if (probe.naturalWidth && probe.naturalHeight &&\n            !el.hasAttribute('width') && !el.hasAttribute('height')) {\n          el.setAttribute('width', probe.naturalWidth);\n          el.setAttribute('height', probe.naturalHeight);\n          el.setAttribute('data-scpw-r', '');\n        }\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.onerror = function () {\n        el.src = u;\n        el.classList.remove('scpw-broken');\n      };\n      probe.src = u;   /* blob is already fetched: decode is near-instant */\n    });\n  }\n\n  function activateImages() {\n    var imgs = document.querySelectorAll('img[data-scpw]');\n    var list = Array.prototype.slice.call(imgs);\n    if (!('IntersectionObserver' in window)) {\n      list.forEach(function (el) { swapImage(el); });\n      return;\n    }\n    /* generous margin: images arrive well before they scroll into\n       view, so late loads never visibly move the text; entries that\n       already intersect fire immediately at observe time */\n    var io = new IntersectionObserver(function (entries) {\n      entries.forEach(function (e) {\n        if (e.isIntersecting) { io.unobserve(e.target); swapImage(e.target); }\n      });\n    }, { rootMargin: '1500px 0px' });\n    list.forEach(function (el) { io.observe(el); });\n  }\n\n  /* CSS: url() references arrive as non-fetching data: placeholders that\n     carry the token:  url(\"data:,SCPW_A7\"). Most small chrome images and\n     fonts are already inlined as data: URIs by the worker; the tokens\n     that remain are resolved here. Background images are applied as\n     each lands (they never move text), fonts are applied in ONE pass\n     so text metrics swap once - and a safety timer guarantees a slow\n     straggler can never hold the page's backgrounds hostage. */\n\n  function patchStyles() {\n    var styles = Array.prototype.slice.call(document.querySelectorAll('style'));\n    var styled = Array.prototype.slice.call(document.querySelectorAll('[style]'));\n    var needed = {};\n    function collect(txt) {\n      var found = String(txt).match(TOKRE);\n      if (found) found.forEach(function (f) { needed[f] = 1; });\n    }\n    styles.forEach(function (s) { collect(s.textContent); });\n    styled.forEach(function (el) { collect(el.getAttribute('style') || ''); });\n    var pats = Object.keys(needed);\n    if (!pats.length) return;\n\n    var reps = {};        /* pat -> resolved blob url */\n    var fontPats = [], imgPats = [];\n    pats.forEach(function (pat) {\n      var tok = pat.match(/SCPW_A\\d+/)[0];\n      var url = CFG.a[tok] || '';\n      if (/\\.(woff2?|ttf|otf|eot)([?#]|$)/i.test(url)) fontPats.push(pat);\n      else imgPats.push(pat);\n    });\n\n    var applyTimer = 0;\n    function apply() {\n      applyTimer = 0;\n      var live = [];\n      for (var pat in reps) live.push({ pat: pat, url: reps[pat] });\n      if (!live.length) return;\n      function rewrite(txt) {\n        var out = txt;\n        live.forEach(function (r) {\n          if (out.indexOf(r.pat) === -1) return;\n          out = out.split(r.pat).join('url(\"' + r.url + '\")');\n        });\n        return out;\n      }\n      styles.forEach(function (s) {\n        var txt = String(s.textContent);\n        var out = rewrite(txt);\n        if (out !== txt) { try { s.textContent = out; } catch (e) {} }\n      });\n      styled.forEach(function (el) {\n        var at = el.getAttribute('style');\n        if (!at) return;\n        var out = rewrite(at);\n        if (out !== at) { try { el.setAttribute('style', out); } catch (e) {} }\n      });\n    }\n    function scheduleApply() {\n      if (!applyTimer) applyTimer = setTimeout(apply, 60);\n    }\n    function landed(pat, u) {\n      if (!u) return;\n      reps[pat] = u;\n      scheduleApply();\n    }\n\n    /* background/image tokens: swap in as they arrive */\n    imgPats.forEach(function (pat) {\n      resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) { landed(pat, u); });\n    });\n    /* font tokens: wait for all, then swap once (no metric reflow storm) */\n    Promise.all(fontPats.map(function (pat) {\n      return resolveToken(pat.match(/SCPW_A\\d+/)[0]).then(function (u) { return { pat: pat, url: u }; });\n    })).then(function (list) {\n      list.forEach(function (r) { if (r.url) reps[r.pat] = r.url; });\n      apply();\n    });\n    /* safety deadline: apply whatever is ready by now */\n    setTimeout(apply, 3000);\n  }\n\n  /* ---------------- interactions the wiki JS used to provide ----------- */\n\n  /* Sigma-9 side bar (the fixed ≡ button, top-left). The real site opens\n     it with a #side-bar fragment + CSS :target rules; inside a sandboxed\n     srcdoc frame fragment navigation never happens, so the bridge drives\n     the same open/close state with a class + equivalent CSS. */\n\n  function sbIsOpen() {\n    return document.documentElement.classList.contains('scpw-sb');\n  }\n\n  function sbOpen() {\n    if (sbIsOpen()) return;\n    document.documentElement.classList.add('scpw-sb');\n  }\n\n  function sbClose() {\n    document.documentElement.classList.remove('scpw-sb');\n  }\n\n  function scrollToAnchor(id) {\n    id = String(id).replace(/^#/, '');\n    if (!id) return;\n    var el = document.getElementById(id);\n    if (!el) {\n      var named = document.getElementsByName(id);\n      if (named && named.length) el = named[0];\n    }\n    if (el && el.scrollIntoView) el.scrollIntoView(true);\n  }\n\n  /* dropdown parents in the top bar: their \"javascript:;\" hrefs are\n     stripped by the worker, so the bridge toggles the submenu itself */\n  function toggleMenu(li) {\n    var parent = li.parentNode;\n    var willOpen = !li.classList.contains('scpw-open');\n    if (parent && parent.querySelectorAll) {\n      parent.querySelectorAll('li.scpw-open').forEach(function (o) {\n        if (o !== li) o.classList.remove('scpw-open');\n      });\n    }\n    li.classList.toggle('scpw-open', willOpen);\n  }\n\n  function tabviewInit() {\n    document.querySelectorAll('.yui-navset').forEach(function (set) {\n      var lis = set.querySelectorAll('.yui-nav li');\n      var panes = set.querySelectorAll('.yui-content > div');\n      var anyOn = false;\n      for (var i = 0; i < panes.length; i++) { if (panes[i].classList.contains('scpw-on')) anyOn = true; }\n      if (!anyOn) { selectTab(set, 0); }\n    });\n  }\n\n  function selectTab(set, idx) {\n    var lis = set.querySelectorAll('.yui-nav li');\n    var panes = set.querySelectorAll('.yui-content > div');\n    for (var i = 0; i < lis.length; i++) {\n      lis[i].classList.toggle('selected', i === idx);\n      lis[i].classList.toggle('scpw-on', i === idx);\n    }\n    for (var j = 0; j < panes.length; j++) {\n      panes[j].classList.toggle('scpw-on', j === idx);\n      panes[j].classList.toggle('selected', j === idx);\n    }\n  }\n\n  function init() {\n    /* focus-mode styles + tabview styles + broken-image styles */\n    var css = document.createElement('style');\n    css.textContent =\n      'html.scpw-focus #navi-bar,html.scpw-focus #navi-bar-shadow,' +\n      'html.scpw-focus #header,html.scpw-focus #top-bar,' +\n      'html.scpw-focus #side-bar,html.scpw-focus #search-top-box,' +\n      'html.scpw-focus #login-status,html.scpw-focus #footer,' +\n      'html.scpw-focus #page-info,html.scpw-focus .page-tags,' +\n      'html.scpw-focus #footer-bar-below,html.scpw-focus #footer-below' +\n      '{display:none!important}' +\n      'html.scpw-focus #container-wrap{margin-top:0!important}' +\n      'html.scpw-focus #content-wrap{margin:0!important}' +\n      'html.scpw-focus #main-content{margin:0!important}' +\n      '.yui-navset .yui-content>div{display:none}' +\n      '.yui-navset .yui-content>div.scpw-on{display:block}' +\n      '.scpw-broken{opacity:.15!important}' +\n      'a.scpw-file::after{content:\" \\\\2193\";font-size:.8em;opacity:.6}' +\n      /* wikidot hover tooltips (edit/flag/report hover text) are positioned\n         and toggled by the site's own JS, which never runs here - without\n         it they would sit visibly over the page like stray dialogs */\n      '#odialog-hovertips,.hovertip{display:none!important}' +\n      /* side-bar open state (class twin of sigma-9's #side-bar:target) */\n      'html.scpw-sb #side-bar{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:15rem!important;max-width:82vw;' +\n      'height:100%!important;overflow-y:auto!important;z-index:9990!important;margin:0!important}' +\n      'html.scpw-sb #side-bar .close-menu{display:block!important;position:fixed!important;' +\n      'top:0!important;left:0!important;width:100%!important;height:100%!important;' +\n      'background:rgba(0,0,0,.35);z-index:-1;margin:0!important;padding:0!important;border:0}' +\n      /* top-bar dropdowns on touch */\n      '#top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}' +\n      '.mobile-top-bar li.scpw-open>ul{display:block!important;position:relative!important;float:none!important}' +\n      /* proportional boxes for bridge-measured images: overrides the\n         written height ATTRIBUTE (author css beats presentational hints)\n         while every real site rule still wins on specificity */\n      ':where(img[data-scpw-r]){height:auto}';\n    (document.head || document.documentElement).appendChild(css);\n\n    tabviewInit();\n    activateImages();\n    patchStyles();\n    sendReady();\n  }\n\n  function sendReady() {\n    var d = document.documentElement;\n    send({\n      scpw: 'ready',\n      title: document.title || '',\n      url: CFG.u,\n      scrollH: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n      y: window.scrollY || 0,\n    });\n  }\n\n  /* ---------------- click routing (capture phase) ---------------- */\n\n  document.addEventListener('click', function (e) {\n    if (e.defaultPrevented) return;\n    var t = e.target;\n    var closest = (t && t.closest) ? t.closest.bind(t) : null;\n    if (!closest) return;\n\n    /* tabview tabs */\n    var tabLink = closest('.yui-nav a');\n    if (tabLink) {\n      var set = tabLink.closest('.yui-navset');\n      if (set) {\n        e.preventDefault(); e.stopPropagation();\n        var lis = set.querySelectorAll('.yui-nav li');\n        var li = tabLink.closest('li');\n        var idx = Array.prototype.indexOf.call(lis, li);\n        selectTab(set, idx < 0 ? 0 : idx);\n        return;\n      }\n    }\n\n    /* collapsible blocks (wikidot [[collapsible]] - \"+ Reveal ...\"\n       links). State lives in the inline display of the two halves:\n       folded visible + unfolded display:none means CLOSED; one tap swaps\n       them (the reveal link sits in .folded, the hide link inside\n       .unfolded-link). */\n    var clps = closest('.collapsible-block-link');\n    if (clps) {\n      var block = clps.closest('.collapsible-block');\n      if (block) {\n        e.preventDefault(); e.stopPropagation();\n        var folded = block.querySelector('.collapsible-block-folded');\n        var unfolded = block.querySelector('.collapsible-block-unfolded');\n        if (folded && unfolded) {\n          /* inline display '' = open (the reveal state we write back),\n             'none' = closed; real wikidot markup always ships the\n             inline display:none on the unfolded half */\n          var closed = unfolded.style.display === 'none';\n          folded.style.display = closed ? 'none' : '';\n          unfolded.style.display = closed ? '' : 'none';\n        }\n        return;\n      }\n    }\n\n    /* in-page scroll targets preserved by the worker from the page's tap\n       handlers - the superscript footnote references on thousands of\n       articles now carry data-scpw-scroll and jump to their footnote */\n    var scrl = closest('[data-scpw-scroll]');\n    if (scrl) {\n      e.preventDefault(); e.stopPropagation();\n      scrollToAnchor(scrl.getAttribute('data-scpw-scroll'));\n      return;\n    }\n\n    /* file downloads (worker-marked) */\n    var fileLink = closest('a[data-scpw-file]');\n    if (fileLink) {\n      e.preventDefault(); e.stopPropagation();\n      send({ scpw: 'file', href: fileLink.getAttribute('data-scpw-file') });\n      return;\n    }\n\n    /* form submit buttons: the frame sandbox blocks real form submission\n       (no allow-forms), so the bridge resolves the form itself. Must run\n       before the no-href/link branches below. */\n    var subBtn = null;\n    if ((t.tagName === 'INPUT' || t.tagName === 'BUTTON') && t.closest && t.closest('form')) {\n      var sTy = String(t.getAttribute('type') || (t.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();\n      if (sTy === 'submit' || sTy === 'image') subBtn = t;\n    }\n    if (subBtn) {\n      e.preventDefault(); e.stopPropagation();\n      handleForm(subBtn.closest('form'), subBtn);\n      return;\n    }\n\n    /* dropdown parents (wikidot \"javascript:;\" links - href stripped) */\n    var anyA = closest('a');\n    if (anyA && !anyA.getAttribute('href')) {\n      var li = anyA.closest('li');\n      if (li && li.querySelector('ul')) {\n        e.preventDefault(); e.stopPropagation();\n        toggleMenu(li);\n        return;\n      }\n    }\n\n    /* normal links */\n    var a = closest('a[href]');\n    if (!a) return;\n    var href = a.getAttribute('href') || '';\n    if (!href) return;\n    if (href.charAt(0) === '#') {\n      /* fragment links never navigate inside the sandbox: the sigma side\n         bar menu, its close scrim and in-page anchors are handled here */\n      e.preventDefault(); e.stopPropagation();\n      var frag = href.slice(1);\n      if (closest('.close-menu')) { sbClose(); return; }\n      if (frag === 'side-bar') { if (sbIsOpen()) sbClose(); else sbOpen(); return; }\n      if (!frag) { sbClose(); return; }\n      scrollToAnchor(frag);\n      return;\n    }\n    if (/^(javascript|mailto|tel|sms|about|data|blob):/i.test(href)) {\n      e.preventDefault();\n      if (/^mailto:|^tel:/i.test(href)) send({ scpw: 'ext', href: href, kind: 'contact' });\n      return;\n    }\n    e.preventDefault();\n    send({ scpw: 'nav', href: href });\n  }, true);\n\n  /* ---------------- forms (GET becomes navigation) ----------------\n\n     The sandboxed frame has no allow-forms, so real submit events never\n     fire: submit-button clicks and Enter-in-textfield are captured instead\n     and resolved here. The submit listener stays as a backstop. */\n\n  function handleForm(f, submitter) {\n    if (!f || !f.tagName || f.tagName.toUpperCase() !== 'FORM') return;\n    var method = (f.getAttribute('method') || 'get').toLowerCase();\n    var action = f.getAttribute('action') || CFG.u;\n    /* wikidot's search box carries a placeholder action (\"dummy\") that its\n       own scripts would rewrite at runtime; route it to the app's search */\n    if (/\\/dummy\\/?$/.test(action) || f.id === 'search-top-box-form') {\n      var sq = '';\n      try {\n        new FormData(f).forEach(function (v, k) {\n          if (k === 'query' && typeof v === 'string' && String(v).trim()) sq = String(v).trim();\n        });\n      } catch (err) {}\n      if (sq) send({ scpw: 'search', q: sq });\n      return;\n    }\n    if (method !== 'get') {\n      send({ scpw: 'blocked', reason: 'post', href: action });\n      return;\n    }\n    try {\n      var qs = new URLSearchParams();\n      new FormData(f).forEach(function (v, k) {\n        if (typeof v === 'string') qs.append(k, v);\n      });\n      if (submitter && submitter.name) qs.append(submitter.name, submitter.value || '');\n      var q = qs.toString();\n      send({ scpw: 'nav', href: action + (q ? (action.indexOf('?') > -1 ? '&' : '?') + q : '') });\n    } catch (err) {\n      send({ scpw: 'blocked', reason: 'form', href: action });\n    }\n  }\n\n  /* Enter in a text field = implicit form submission */\n  document.addEventListener('keydown', function (e) {\n    if (e.key !== 'Enter' || e.defaultPrevented) return;\n    var t = e.target;\n    if (!t || !t.closest || t.tagName !== 'INPUT') return;\n    var ty = String(t.getAttribute('type') || 'text').toLowerCase();\n    if (!/^(text|search|email|url|number|tel|password)$/.test(ty)) return;\n    var form = t.closest('form');\n    if (!form) return;\n    e.preventDefault(); e.stopPropagation();\n    handleForm(form, null);\n  }, true);\n\n  document.addEventListener('submit', function (e) {\n    e.preventDefault(); e.stopPropagation();\n    handleForm(e.target, null);\n  }, true);\n\n  /* ---------------- scroll reporting ---------------- */\n\n  var lastSent = 0;\n  function reportScroll(force) {\n    var now = Date.now();\n    if (!force && now - lastSent < 250) return;\n    lastSent = now;\n    var d = document.documentElement;\n    send({\n      scpw: 'scroll',\n      y: Math.round(window.scrollY || document.body.scrollTop || 0),\n      h: Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0),\n    });\n  }\n  window.addEventListener('scroll', function () { reportScroll(false); }, { passive: true });\n\n  /* ---------------- nested content frames ----------------\n\n     The worker keeps real content iframes (the SCP-6634 game, the\n     interwiki language widget) in rendered pages and proxies them\n     through /api/frame with a shim that posts link taps to its parent -\n     this frame. Relay those to the app like ordinary link clicks. */\n  window.addEventListener('message', function (e) {\n    var d = e.data;\n    if (!d || d.scpw !== 'frame-nav') return;\n    if (typeof d.href === 'string' && d.href) send({ scpw: 'nav', href: d.href });\n  });\n\n  /* ---------------- parent commands ---------------- */\n\n  window.addEventListener('message', function (e) {\n    var d = e.data;\n    if (!d || d.scpw !== 'cmd') return;\n    if (d.op === 'scrollTo') {\n      window.scrollTo(0, d.y || 0);\n    } else if (d.op === 'anchor') {\n      var id = String(d.a || '').replace(/^#/, '');\n      if (id) {\n        var el = document.getElementById(id);\n        if (!el) {\n          var named = document.getElementsByName(id);\n          if (named && named.length) el = named[0];\n        }\n        if (el && el.scrollIntoView) el.scrollIntoView(true);\n        else window.scrollTo(0, 0);\n      }\n    } else if (d.op === 'zoom') {\n      document.body.style.zoom = d.z || 1;\n      var vp = document.querySelector('meta[name=viewport]');\n      if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1');\n    } else if (d.op === 'focus') {\n      document.documentElement.classList.toggle('scpw-focus', !!d.on);\n    } else if (d.op === 'ping') {\n      sendReady();\n    } else if (d.op === 'top') {\n      window.scrollTo(0, 0);\n    }\n  });\n\n  /* ---------------- boot ---------------- */\n\n  window.SCPW_INIT = function (cfg) {\n    CFG = cfg || {};\n    if (document.readyState === 'loading') {\n      document.addEventListener('DOMContentLoaded', function () { init(); });\n    } else {\n      init();\n    }\n  };\n})();\n";
+
+/* ------------------------------------------------------------------ */
+/* Content-iframe policy (used by /api/render)                        */
+/* ------------------------------------------------------------------ */
+
+/* Decide the fate of one <iframe attrs="..."> from a rendered page.
+   Returns the replacement tag ('' = removed). Content iframes (the
+   SCP-6634 game, interwiki widgets, video embeds) are rewritten to the
+   worker's /api/frame proxy; hidden theme-machinery frames, ad/consent
+   frames, srcdoc frames and invisible 0x0 trackers are dropped. */
+function frameTag(attrs, R, env, workerOrigin) {
+  const raw = '<iframe' + (attrs || '') + '>';
+  if (attrVal(raw, 'data-scpw-frame') != null) return raw;   /* idempotent */
+
+  if (attrVal(raw, 'srcdoc') != null) return '';
+  const src = attrVal(raw, 'src');
+  if (src == null || !String(src).trim()) return '';
+
+  /* hidden interwiki styleFrames are wikidot's theme loader: the real
+     site's JS fetches their ?theme=<css url> and injects it as a
+     stylesheet. The frame itself dies, but the theme it would load is
+     harvested here (priority keeps the cascade order) and inlined by
+     rewriteDocument - this is how pages like scp-6000/6634/L093 get
+     their redtape / basalt / classic themes. */
+  const sfm = String(src).match(/styleFrame\.html/i);
+  if (sfm) {
+    try {
+      const tm = String(src).match(/[?&]theme=([^&]+)/);
+      if (tm) {
+        const theme = decodeURIComponent(tm[1]);
+        const pm = String(src).match(/[?&]priority=(-?\d+)/);
+        (R.extraStyles = R.extraStyles || []).push({
+          priority: pm ? +pm[1] : 0,
+          href: theme,
+        });
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  const style = attrVal(raw, 'style') || '';
+  if (/display\s*:\s*none/i.test(style)) return '';          /* hidden */
+  if (/(?:^|[;\s])(?:width|height)\s*:\s*0(?:px)?\s*(?:;|$)/i.test(style)) return '';
+  const w = attrVal(raw, 'width'), h = attrVal(raw, 'height');
+  if (w === '0' || h === '0' || w === '0px' || h === '0px') return '';
+
+  if (isAdTag(raw)) return '';                               /* ad/consent hosts + markers */
+
+  const abs = absUrl(src, R.base);
+  if (!abs) return '';
+  let u;
+  try { u = new URL(abs); } catch (e) { return ''; }
+  if (!assetUrlOk(u, env)) return '';                        /* private / ad hosts */
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+
+  let out = ('<iframe' + (attrs || '')).replace(/\s*\/?\s*$/, '') + '>';
+  /* drop event handlers, page sandbox and srcdoc fallback text */
+  out = out.replace(/\s(?:on[a-z]+|sandbox|srcdoc)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  out = setAttr(out, 'src', workerOrigin + '/api/frame?url=' + encodeURIComponent(abs));
+  out = setAttr(out, 'data-scpw-frame', '');
+  out = setAttr(out, 'loading', 'lazy');
+  /* MUST be a closed empty element: an unclosed <iframe> would make the
+     HTML parser treat everything after it as raw fallback text, killing
+     the rest of the document (this exact bug ate whole articles) */
+  return out + '</iframe>';
+}
 
 function makeRewriter(finalUrl) {
   const R = {
@@ -585,9 +651,21 @@ async function rewriteDocument(html, R, env, workerOrigin) {
   /* --- 1. remove ALL scripts (the page's JS never runs client-side) --- */
   html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>|<script\b[^>]*\/?>/gi, '');
 
-  /* --- 2. remove framed / embedded / base / noscript / media sources --- */
-  html = html.replace(/<(iframe|object|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
-  html = html.replace(/<\/?(iframe|object|embed|noscript|base|frame|frameset|applet|source|track|template)\b[^>]*\/?>/gi, '');
+  /* --- 2. frames: content iframes survive, machinery dies ---------
+
+     Real embedded content (the SCP-6634 Godot game on
+     ironshears.github.io, the interwiki.scpwiki.com language widget,
+     video embeds) is KEPT and pointed at /api/frame, which proxies the
+     frame document with its scripts intact. Hidden style-loader
+     iframes, ad/consent frames, srcdoc frames and 0x0 tracker frames
+     are still dropped - exactly what the page's own CSS/JS hides or
+     removes on the live site. */
+  html = html.replace(/<iframe\b([^>]*)>([\s\S]*?)<\/iframe\s*>/gi,
+    (m, attrs) => frameTag(attrs, R, env, workerOrigin));
+  html = html.replace(/<iframe\b((?![^>]*data-scpw-frame)[^>]*?)\/?>/gi,
+    (m, attrs) => frameTag(attrs, R, env, workerOrigin));
+  html = html.replace(/<(object|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+  html = html.replace(/<\/?(object|embed|noscript|base|frame|frameset|applet|source|track|template)\b[^>]*\/?>/gi, '');
 
   /* --- 3. remove ad / tracker img + link tags + empty ad-holder divs --- */
   html = html.replace(/<img\b[^>]*\/?>/gi, m => (isAdTag(m) ? '' : m));
@@ -595,7 +673,17 @@ async function rewriteDocument(html, R, env, workerOrigin) {
   html = html.replace(/<div\b[^>]*\bid="(confiant_tag_holder|wad-\d+|atContainer|ad-container|ad-slot)"[^>]*>\s*<\/div>/gi, '');
   html = removeThemeBanner(html);
 
-  /* --- 4. strip inline event handlers + srcset --- */
+  /* --- 4. strip inline event handlers + srcset, but first rescue the
+         ones that carry real behavior: footnote references call
+         WIKIDOT.page.utils.scrollToReference('footnote-N') - with the
+         onclick gone the superscript links would be dead. The target
+         id survives as data-scpw-scroll and the bridge scrolls on tap. --- */
+  html = html.replace(/\sonclick\s*=\s*("([^"]*)"|'([^']*)')/gi, (m, all, dq, sq) => {
+    const code = dq !== undefined ? dq : sq;
+    const mm = String(code).match(/scrollToReference\(\s*['"]([^'"]+)['"]\s*\)/);
+    if (mm) return ' data-scpw-scroll="' + encodeEnt(mm[1]) + '"';
+    return '';
+  });
   html = html.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
   html = html.replace(/\ssrcset\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
 
@@ -642,6 +730,20 @@ async function rewriteDocument(html, R, env, workerOrigin) {
       .catch(() => null);
   }));
 
+  /* --- 7b. themes harvested from the styleFrame iframes (cascade order
+         by their priority param) - spliced in before </head> at step 8b --- */
+  let frameThemeCss = [];
+  if (R.extraStyles && R.extraStyles.length) {
+    R.extraStyles.sort((a, b) => a.priority - b.priority);
+    frameThemeCss = await Promise.all(R.extraStyles.map(j => {
+      const abs = absUrl(j.href, R.base);
+      if (!abs || !assetUrlOk(new URL(abs), env)) return Promise.resolve(null);
+      return fetchCssRaw(abs)
+        .then(t => inlineCss(t, abs, env, R, 0))
+        .catch(() => null);
+    }));
+  }
+
   /* --- 8. splice processed css back in, in document order --- */
   styleJobs.forEach((j, i) => {
     let tag = '<style' + (j.attrs || '') + '>';
@@ -657,6 +759,22 @@ async function rewriteDocument(html, R, env, workerOrigin) {
     const media = j.media ? ' media="' + encodeEnt(j.media) + '"' : '';
     html = html.split('\x00L' + i + '\x00').join('<style' + media + '>' + txt + '</style>');
   });
+
+  /* --- 8b. spliced-in styleFrame themes (end of head = highest
+         cascade priority, mirroring how late the real site injects them) --- */
+  const frameThemeTags = frameThemeCss
+    .filter(t => t != null && t.length)
+    .map(t => '<style>' + t + '</style>')
+    .join('');
+  if (frameThemeTags) {
+    if (/<\/head\s*>/i.test(html)) {
+      html = html.replace(/<\/head\s*>/i, frameThemeTags + '</head>');
+    } else if (/<body\b[^>]*>/i.test(html)) {
+      html = html.replace(/<body\b[^>]*>/i, '<head>' + frameThemeTags + '</head><body>');
+    } else {
+      html = frameThemeTags + html;
+    }
+  }
 
   /* --- 9. images -> token placeholders + 1px gif --- */
   html = html.replace(/<img\b[^>]*\/?>/gi, (tag) => {
@@ -1058,8 +1176,275 @@ async function assetStream(request, env, ctx, tu, upstream, cacheKey) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Crom GraphQL helpers (search + random)                              */
+/* /api/frame - content-iframe proxy (games, interwiki, embeds)       */
+/*                                                                    */
+/* Rendered pages keep their REAL content iframes, but the sandboxed  */
+/* app frame cannot navigate to them (and the phone must only talk    */
+/* to the worker). /api/frame therefore serves the frame document     */
+/* itself - scripts INTACT, unlike /api/render - with every static    */
+/* subresource rewritten to /api/asset and an injected shim that      */
+/* routes JS fetch/XHR (the Godot loader pulling Haven.wasm/.pck)     */
+/* through the worker too. Wiki PAGE hosts are refused here: pages    */
+/* only ever come from /api/render.                                   */
 /* ------------------------------------------------------------------ */
+
+const FRAME_MAX = 6 * 1024 * 1024;
+
+function frameUrlOk(u, env) {
+  if (!assetUrlOk(u, env)) return false;
+  const h = u.hostname.toLowerCase();
+  /* wikidot [[iframe]] blocks embed wiki-hosted FRAGMENT pages
+     (/fragment:<name>/html/<hash>) - they are content, not pages, and
+     refusing them broke every iframe embed on pages like scp-6500 */
+  if (u.pathname.startsWith('/fragment:') && hostAllowed(h, env)) return true;
+  /* widget + uploaded-file hosts of the wiki family */
+  if (h === 'interwiki.scpwiki.com') return true;
+  if (h === 'wdfiles.com' || h.endsWith('.wdfiles.com')) return true;
+  if (WIKIDOT_CDN_RE.test(h)) return true;
+  /* real wiki pages must come through /api/render */
+  if (hostAllowed(h, env)) return false;
+  /* any other public content host (ironshears.github.io & friends) */
+  return true;
+}
+
+/* The injected shim (runs before the frame document's own scripts):
+   - fetch/XHR with http(s) urls are re-pointed at /api/asset, resolved
+     against the real page url (kept as <base>) so relative engine files
+     like Haven.pck land on the worker, never on the phone's network
+   - localStorage gets an in-memory twin (opaque sandbox origins throw
+     on access, which would kill some game loaders at boot)
+   - link taps are posted to the parent (the bridge relays them to the
+     app as normal navigations - this is what makes the interwiki
+     language widget actually navigate the browser) */
+function frameShimSrc(workerOrigin) {
+  const W = JSON.stringify(workerOrigin);
+  return '(function(){' +
+    'var W=' + W + ';' +
+    'function prox(u){try{' +
+      'if(u==null)return u;' +
+      'var s=String(u);' +
+      'if(/^(data:|blob:|about:)/i.test(s))return s;' +
+      'var abs=new URL(s,document.baseURI).href;' +
+      'if(!/^https?:/i.test(abs))return s;' +
+      'if(abs.indexOf(W+"/")===0||abs===W)return abs;' +
+      'return W+"/api/asset?url="+encodeURIComponent(abs);' +
+    '}catch(e){return u;}}' +
+    'var of=window.fetch;' +
+    'if(typeof of==="function"){window.fetch=function(input,init){' +
+      'try{if(typeof input==="string")return of(prox(input),init);}catch(e){}' +
+      'return of.apply(window,arguments);};}' +
+    'var oo=XMLHttpRequest.prototype.open;' +
+    'XMLHttpRequest.prototype.open=function(method,url){' +
+      'var rest=Array.prototype.slice.call(arguments,2);' +
+      'var pu;try{pu=prox(url);}catch(e){pu=null;}' +
+      'return oo.apply(this,[method,(pu==null||pu===undefined)?url:pu].concat(rest));};' +
+    'try{window.localStorage.getItem("__scpw");}catch(e){try{' +
+      'var mem={};' +
+      'Object.defineProperty(window,"localStorage",{configurable:true,value:{' +
+        'getItem:function(k){k=String(k);return Object.prototype.hasOwnProperty.call(mem,k)?mem[k]:null;},' +
+        'setItem:function(k,v){mem[String(k)]=String(v);},' +
+        'removeItem:function(k){delete mem[String(k)];},' +
+        'clear:function(){mem={};},' +
+        'key:function(i){var ks=Object.keys(mem);return i<ks.length?ks[i]:null;},' +
+        'get length(){return Object.keys(mem).length;}}});}catch(e2){}}' +
+    'document.addEventListener("click",function(e){' +
+      'if(e.defaultPrevented||e.button)return;' +
+      'var t=e.target;var a=t&&t.closest?t.closest("a[href]"):null;' +
+      'if(!a)return;' +
+      'var h=a.getAttribute("href")||"";' +
+      'if(/^(javascript:|#|mailto:|tel:)/i.test(h)){e.preventDefault();return;}' +
+      'var abs;try{abs=new URL(h,document.baseURI).href;}catch(err){return;}' +
+      'e.preventDefault();e.stopPropagation();' +
+      'try{parent.postMessage({scpw:"frame-nav",href:abs},"*");}catch(err){}' +
+    '},true);' +
+    '})();';
+}
+
+function frameAsset(abs, workerOrigin) {
+  return workerOrigin + '/api/asset?url=' + encodeURIComponent(abs);
+}
+
+/* Rewrite one tag attribute to its worker-proxied url (or drop it when
+   the host is not fetchable). Shared by script/img/link/media tags. */
+function proxifyAttr(tag, attr, finalUrl, workerOrigin, env) {
+  const v = attrVal(tag, attr);
+  if (v == null || !String(v).trim()) return tag;
+  if (/^(data|blob|about):/i.test(v)) return tag;
+  const abs = absUrl(v, finalUrl);
+  if (!abs) return tag;
+  let u;
+  try { u = new URL(abs); } catch (e) { return tag; }
+  if (!assetUrlOk(u, env)) return removeAttr(tag, attr);
+  return setAttr(tag, attr, frameAsset(abs, workerOrigin));
+}
+
+function proxifyCssUrls(css, finalUrl, workerOrigin, env) {
+  return String(css).replace(
+    /url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")\s]+))\s*\)/gi,
+    (m, d2, s2, u2) => {
+      const raw = d2 !== undefined ? d2 : (s2 !== undefined ? s2 : u2);
+      if (raw == null || !raw || /^(data|blob|about):/i.test(raw)) return m;
+      const abs = absUrl(String(raw).trim(), finalUrl);
+      if (!abs) return m;
+      try {
+        if (!assetUrlOk(new URL(abs), env)) return m;
+      } catch (e) { return m; }
+      return 'url("' + frameAsset(abs, workerOrigin) + '")';
+    });
+}
+
+function rewriteFrameDoc(html, finalUrl, workerOrigin, env) {
+  let doc = String(html);
+
+  /* CSP / refresh metas + any existing <base> (we install our own) */
+  doc = doc.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy[^>]*>/gi, '');
+  doc = doc.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh[^>]*>/gi, '');
+  doc = doc.replace(/<base\b[^>]*\/?>/gi, '');
+
+  const R = { base: finalUrl };
+
+  /* scripts stay - the game IS its scripts */
+  doc = doc.replace(/<script\b[^>]*>/gi, m => proxifyAttr(m, 'src', finalUrl, workerOrigin, env));
+  doc = doc.replace(/<img\b[^>]*\/?>/gi, m => proxifyAttr(m, 'src', finalUrl, workerOrigin, env));
+  doc = doc.replace(/<link\b[^>]*\/?>/gi, m => proxifyAttr(m, 'href', finalUrl, workerOrigin, env));
+  doc = doc.replace(/<(?:video|audio|source|embed|track)\b[^>]*\/?>/gi, m => {
+    let out = proxifyAttr(m, 'src', finalUrl, workerOrigin, env);
+    out = proxifyAttr(out, 'poster', finalUrl, workerOrigin, env);
+    return out;
+  });
+  doc = doc.replace(/<object\b[^>]*\/?>/gi, m => proxifyAttr(m, 'data', finalUrl, workerOrigin, env));
+  /* nested iframes recurse through the frame proxy (same policy) */
+  doc = doc.replace(/<iframe\b([^>]*)>([\s\S]*?)<\/iframe\s*>/gi,
+    (m, attrs) => frameTag(attrs, R, env, workerOrigin));
+  doc = doc.replace(/<iframe\b((?![^>]*data-scpw-frame)[^>]*?)\/?>/gi,
+    (m, attrs) => frameTag(attrs, R, env, workerOrigin));
+
+  /* css url()s (style blocks + inline styles) */
+  doc = doc.replace(/<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi, (m, attrs, css) =>
+    '<style' + attrs + '>' + proxifyCssUrls(css, finalUrl, workerOrigin, env) + '</style>');
+  doc = doc.replace(/\sstyle\s*=\s*("([^"]*)"|'([^']*)')/gi, (m, all, dq, sq) => {
+    const css = dq !== undefined ? dq : sq;
+    const out = proxifyCssUrls(css, finalUrl, workerOrigin, env);
+    if (out === css) return m;
+    return ' style=' + (dq !== undefined ? '"' : "'") + encodeEnt(out) + (dq !== undefined ? '"' : "'");
+  });
+
+  /* inject <base> + shim as the very first things after <head> */
+  const head = '<base href="' + encodeEnt(finalUrl) + '">' +
+    '<script>' + frameShimSrc(workerOrigin) + '</scr' + 'ipt>';
+  if (/<head\b[^>]*>/i.test(doc)) {
+    doc = doc.replace(/<head\b[^>]*>/i, m => m + head);
+  } else if (/<html\b[^>]*>/i.test(doc)) {
+    doc = doc.replace(/<html\b[^>]*>/i, m => m + '<head>' + head + '</head>');
+  } else {
+    doc = '<!doctype html><html><head>' + head + '</head>' + doc;
+  }
+
+  return doc;
+}
+
+async function buildFrame(targetUrl, env, workerOrigin) {
+  const tu = new URL(targetUrl);
+  let current = 'https://' + tu.hostname + tu.pathname + tu.search;
+
+  /* manual redirect tracking: the final URL is what relative engine
+     files resolve against, so it must be exact */
+  let res;
+  for (let hop = 0; ; hop++) {
+    if (hop >= 8) { const e = new Error('too many redirects'); e.status = 508; throw e; }
+    res = await fetchWithTimeout(current, {
+      method: 'GET',
+      headers: {
+        'accept': 'text/html,application/xhtml+xml',
+        'accept-language': 'en',
+        'user-agent': UA_MOBILE,
+      },
+      redirect: 'manual',
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      let next;
+      try { next = new URL(loc, current); } catch (e) { break; }
+      if (next.protocol !== 'https:' && next.protocol !== 'http:') break;
+      if (!frameUrlOk(next, env)) {
+        const e = new Error('redirect leaves allowed frame hosts');
+        e.status = 403;
+        throw e;
+      }
+      current = next.protocol === 'https:' ? next.href : 'https://' + next.hostname + next.pathname + next.search;
+      continue;
+    }
+    break;
+  }
+
+  const ctype = (res.headers.get('content-type') || '').toLowerCase();
+  if (!ctype.includes('text/html') && !ctype.includes('application/xhtml')) {
+    const err = new Error('not an html frame document');
+    err.status = 415;
+    throw err;
+  }
+  const cl = +(res.headers.get('content-length') || 0);
+  if (cl && cl > FRAME_MAX) { const e = new Error('frame document too large'); e.status = 413; throw e; }
+  const html = await res.text();
+  if (html.length > FRAME_MAX) { const e = new Error('frame document too large'); e.status = 413; throw e; }
+
+  return rewriteFrameDoc(html, current, workerOrigin, env);
+}
+
+async function apiFrame(request, env, ctx, url) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return json({ ok: false, error: 'GET only' }, 405);
+  }
+  const targetRaw = url.searchParams.get('url');
+  if (!targetRaw) return json({ ok: false, error: 'missing url parameter' }, 400);
+  let tu;
+  try { tu = new URL(targetRaw); } catch (e) { return json({ ok: false, error: 'bad url' }, 400); }
+  if (tu.protocol !== 'http:' && tu.protocol !== 'https:') {
+    return json({ ok: false, error: 'only http/https frames' }, 400);
+  }
+  if (!frameUrlOk(tu, env)) {
+    return json({ ok: false, error: 'frame host not allowed',
+      detail: 'wiki pages come from /api/render; /api/frame is for embedded content only' }, 403);
+  }
+
+  const cacheKey = url.origin + '/api/frame?url=' + encodeURIComponent(targetRaw.split('#')[0]);
+
+  if (request.method === 'GET' && typeof caches !== 'undefined') {
+    try {
+      const hit = await caches.default.match(new Request(cacheKey, { method: 'GET' }));
+      if (hit) {
+        const h = new Headers(hit.headers);
+        h.set('x-scp-cache', 'hit');
+        return new Response(hit.body, { status: hit.status, headers: h });
+      }
+    } catch (e) {}
+  }
+
+  const out = (async () => {
+    const doc = await buildFrame(tu.href, env, url.origin);
+    return new Response(doc, {
+      status: 200,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'access-control-allow-origin': '*',
+        'cache-control': 'public, max-age=600',
+        'x-scp-proxy': VERSION,
+      },
+    });
+  })();
+
+  try {
+    const res = await out;
+    if (ctx && typeof caches !== 'undefined' && request.method === 'GET') {
+      try { ctx.waitUntil(caches.default.put(new Request(cacheKey, { method: 'GET' }), res.clone())); } catch (e) {}
+    }
+    return res;
+  } catch (e) {
+    return json({ ok: false, error: (e && e.message) || 'frame upstream error' }, (e && e.status) || 502);
+  }
+}
+
 
 async function cromQueryOnce(query, variables) {
   const res = await Promise.race([
@@ -1197,6 +1582,7 @@ async function handle(request, env, ctx) {
         endpoints: {
           render: '/api/render?url=<absolute-wiki-page-url>',
           asset: '/api/asset?url=<absolute-asset-url>',
+          frame: '/api/frame?url=<embedded-content-url> (content iframes - games, interwiki)',
           search: '/api/search?q=<query>[&site=<wiki-host>]',
           random: '/api/random[?site=<wiki-host>]',
           ping: '/__worker/ping',
@@ -1227,11 +1613,12 @@ async function handle(request, env, ctx) {
        phone.                                                                    */
     if (url.pathname === '/api/render') return await apiRender(request, env, ctx, url);
     if (url.pathname === '/api/asset') return await apiAsset(request, env, ctx, url);
+    if (url.pathname === '/api/frame') return await apiFrame(request, env, ctx, url);
     if (url.pathname === '/api/search') return await apiSearch(request, env, url);
     if (url.pathname === '/api/random') return await apiRandom(request, env, url);
 
     return jsonErr(404, 'unknown endpoint',
-      'This worker is API-only. Try /api/render?url=, /api/asset?url=, /api/search?q=, /api/random or /__worker/ping.');
+      'This worker is API-only. Try /api/render?url=, /api/asset?url=, /api/frame?url=, /api/search?q=, /api/random or /__worker/ping.');
   } catch (e) {
     return jsonErr(500, 'worker error', String((e && e.message) || e));
   }
